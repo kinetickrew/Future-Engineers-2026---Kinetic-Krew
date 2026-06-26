@@ -1,64 +1,132 @@
-# WRO Sensor & Actuator Test Repository
+# KineticKrew-FutureEngineer-2026 Skeleton Repository
 
-This repository is a mixed Arduino + Python test workspace for debugging and validating individual sensors, actuators, and I2C devices before they are integrated into the main project.
+This repository is a skeleton clone of the structure used by the KineticKrew Future Engineers project. It contains the same top-level folders and placeholders, but no actual project data, images, CAD files, or compiled code.
 
-## Repository Structure
+## Table of Contents
 
-- `Test Codes/`
-  - `3_TF_Luna/`
-    - `3_TF_Luna.ino` - Arduino test sketch for reading three TF-Luna lidar sensors through an HW-617 I2C multiplexer.
-  - `3_TF_Luna_with_Filter/`
-    - `3_TF_Luna_with_Filter.ino` - Arduino test sketch that reads three TF-Luna sensors and averages multiple samples to reduce noise.
-  - `Servo_Test.ino` - ESP32 servo tester sketch that accepts a serial angle input and moves a servo between 45° and 135°.
-  - `TF_Luna_BNO_Tester.ino` - ESP32 diagnostic sketch for TF-Luna lidars and a BNO055 IMU on an HW-617 I2C multiplexer.
-- `Python/`
-  - Placeholder folder for future Python test scripts and debugging utilities.
+1. Overview
+2. Architecture
+3. Repository Structure
+4. Missing TODO Items
+5. Notes
 
-## Purpose
+## 1. Overview
 
-This repository is intended for:
+This workspace is prepared as an empty repository layout for the Future Engineers project. Use this repo as the starting point for:
 
-- verifying individual hardware components
-- testing sensor connections and I2C multiplexer wiring
-- debugging TF-Luna lidar readings and BNO055 orientation data
-- validating servo movement and serial command handling
-- isolating errors before integration into the main robotics codebase
+- adding robotics design files
+- populating code for Round 1 ESP32 and Round 2 Raspberry Pi
+- adding documentation, images, and build instructions
+- tracking progress with TODO notes in the README
 
-## Included Test Codes
+## 2. Architecture
 
-### `3_TF_Luna.ino`
-- Reads three TF-Luna lidar sensors using HW-617 I2C multiplexer channels 0, 1, and 2.
-- Prints distance readings to the serial monitor.
-- Useful for verifying each lidar sensor and multiplexer channel.
+The robot architecture is split into two rounds, with dedicated code folders for each stage:
 
-### `3_TF_Luna_with_Filter.ino`
-- Similar to `3_TF_Luna.ino`, but averages multiple samples per channel.
-- Useful when testing noisy distance readings and verifying stable output.
-- Configurable sample count and delay between samples.
+- Round 1: `code/round-1-esp32/`
+  - Contains ESP32 Arduino firmware and sensor/control code for:
+    - distance sensor
+    - IMU
+    - motor driver
+    - DC motors
+    - steering servo
+  - Uses a TCA9548A I2C MUX module to connect the TF-LUNA and BNO055 to the ESP32 on shared I2C lines.
+- Round 2: `code/round-2-raspberry-pi/`
+  - Contains Raspberry Pi image processing code and control logic that sends commands to the ESP32.
+- Shared code and utilities: `code/shared/`
+  - Contains any common modules, communication helpers, or libraries used by both rounds.
 
-### `Servo_Test.ino`
-- ESP32-based servo test sketch using `ESP32Servo`.
-- Accepts serial angle input between 45 and 135 degrees.
-- Prints validation messages and moves the servo accordingly.
-- Useful for checking servo response and servo wiring.
+### 3. Hardware Specifications
 
-### `TF_Luna_BNO_Tester.ino`
-- ESP32 diagnostic sketch for reading up to three TF-Luna lidar sensors and a BNO055 IMU.
-- Uses HW-617 I2C multiplexer channels for the lidars and IMU.
-- Prints combined distance and heading data to the serial monitor.
-- Useful for verifying both distance sensors and orientation sensor together.
+* **Distance Sensor – Benewake TF-LUNA Micro LiDAR**
 
-## Usage
+  * **Power Requirement:** 5 V DC, approximately 180 mA
+  * **Communication Interface:** UART
+  * **Operating Range:** 0.2–8 m
+  * **Degrees of Freedom:** 1 (distance measurement)
+  * **Description:** Used for real-time obstacle detection by measuring the distance between the vehicle and surrounding objects.
 
-1. Open the sketch folder or `.ino` file in the Arduino IDE.
-2. Select the correct board and serial port.
-3. Install any required libraries (`ESP32Servo`, `Adafruit_BNO055`, `Adafruit_Sensor`) if needed.
-4. Upload the sketch.
-5. Open the Serial Monitor at `115200` baud to view sensor output.
+* **Inertial Measurement Unit (IMU) – BNO055**
 
-## Notes
+  * **Power Requirement:** 3.3 V DC, approximately 12 mA
+  * **Communication Interface:** I²C
+  * **Degrees of Freedom:** 9 DoF
+  * **Description:** Provides fused orientation, acceleration, gyroscope, and magnetometer data for vehicle localization and motion estimation.
 
-- This repo is focused on test/debug code, not on final control or navigation logic.
-- Keep every hardware-specific diagnostic sketch in `Test Codes/`.
-- Add Python test tools under `Python/` as they are developed.
-- Update this README with new test code names and usage notes when you add new sketches.
+* **Motor Driver – TB6612FNG**
+
+  * **Power Requirement:** 5 V logic, 4.5–13.5 V motor supply, up to 1.2 A per channel
+  * **Communication Interface:** PWM
+  * **Motor Outputs:** 2 channels
+  * **Description:** Controls the speed and direction of the DC drive motors using PWM signals.
+
+* **DC Drive Motor – BO Motor**
+
+  * **Operating Voltage:** 6–12 V DC
+  * **Control Method:** PWM
+  * **Typical Speed:** 200–300 RPM
+  * **Degrees of Freedom:** 1 rotational axis
+  * **Description:** Provides propulsion for the autonomous vehicle. The actual speed depends on the supplied voltage and mechanical load.
+
+* **Steering Servo Motor – MG90S**
+
+  * **Power Requirement:** 5 V DC, 500–900 mA (stall current)
+  * **Communication Interface:** PWM
+  * **Operating Speed:** Approximately 0.2 s per 60°
+  * **Degrees of Freedom:** 1 rotational axis
+  * **Description:** A metal-gear servo motor with approximately 180° rotation, used for precise front-wheel steering.
+
+* **I²C Multiplexer – TCA9548A**
+
+  * **Power Requirement:** 3.3 V / 5 V logic
+  * **Communication Interface:** I²C
+  * **Channels:** 8 independent I²C channels
+  * **Description:** Enables multiple I²C devices to communicate with the ESP32 by eliminating address conflicts on the shared I²C bus.
+
+
+## 4. Repository Structure
+
+The current skeleton includes these directories:
+
+- `.github/workflows/`
+- `FreeCAD-Files/`
+- `Slicer-Files/`
+- `code/`
+  - `round-1-esp32/`
+    - `Test_Codes_Arduino/`
+  - `round-2-raspberry-pi/`
+    - `raspberry-pi-5/`
+  - `shared/`
+- `docs/resources/`
+- `other/`
+- `t-photos/`
+- `v-photos/`
+- `video/`
+
+The structure now uses round-specific folders for ESP32 and Raspberry Pi development, with a shared folder for any common code or utilities.
+
+## 3. Missing TODO Items
+
+This repository is intentionally empty. The following content still needs to be added:
+
+- Add GitHub Actions workflows in `.github/workflows/`
+- Add FreeCAD assembly and part files in `FreeCAD-Files/`
+- Add slicer project files and print settings in `Slicer-Files/`
+- Add firmware and application source code in `code/raspberry-pi-5/` and `code/raspberry-pi-pico-2/`
+- Add shared library/source code in `code/shared/`
+- Add documentation images and resource files in `docs/resources/`
+- Add `other/dhcp-server-on-ethernet-port.md` and `other/image-drive-linux.md`
+- Add team photos and presentation media in `t-photos/`, `v-photos/`, and `video/`
+- Add a project changelog in `CHANGELOG.md`
+- Add an appropriate license in `LICENSE`
+- Add `.gitignore`, `.gitattributes`, `.clang-format`, and `.gitmodules` if needed
+- Fill in the major README sections:
+  - Overview
+  - Mobility Management
+  - Power and Sense Management
+  - Obstacle Management
+  - Source Code
+  - List of Components
+  - 3D Model Files
+  - Building Instructions
+  - Extras
