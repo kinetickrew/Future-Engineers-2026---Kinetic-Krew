@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-
+ 
 # Open the webcam (0 is usually the built-in webcam)
 cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
 
@@ -39,6 +39,7 @@ while True:
     mask_red = mask_red1 + mask_red2
     
     mask_green = cv2.inRange(hsv_frame, low_green, high_green)
+
 
     # --- DETECT AND DRAW BOXES ---
     # We find contours (outlines) of the colored sections
