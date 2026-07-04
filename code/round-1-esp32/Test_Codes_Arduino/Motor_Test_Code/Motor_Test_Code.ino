@@ -1,48 +1,80 @@
-#include <ESP32Servo.h>
-#define SERVO_PIN 13
-Servo testServo;
+// Motor Pin Definitions
+const int IN1 = 25;
+const int IN2 = 26;
+const int PWM_PIN = 33;
+
+
+// Timing variable
+unsigned long lastUpdate = 0;
+int currentSpeed = 255;
+int stepAmount = -50; // Decrease by 50 each second
+
 
 void setup() {
- Serial.begin(115200);
-  // Attach the servo to pin 13
- testServo.attach(SERVO_PIN);
-  // Start the servo at your dead-center position (90 degrees)
- testServo.write(90);
-  Serial.println("=========================================");
- Serial.println("      ESP32 SERVO ANGLE TESTER           ");
- Serial.println("=========================================");
- Serial.println("Enter an angle between 45 and 135:");
+  // Initialize motor control pins as outputs
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(PWM_PIN, OUTPUT);
+  
+  Serial.begin(115200);
+  Serial.println("Motor Test Initialized. Starting at 255...");
 }
-
-
 
 
 void loop() {
- // Check if there is data waiting in the Serial buffer
- if (Serial.available() > 0) {
- 
-   // Read the incoming string until the user hits Enter
-   String inputString = Serial.readStringUntil('\n');
- 
-   // Trim any accidental whitespaces or newline characters
-   inputString.trim();
- 
-   // Convert the string to an integer
-   int targetAngle = inputString.toInt();
- 
-   // Validate if the input is within your precise safe limits
-   if (targetAngle >= 45 && targetAngle <= 135) {
-     Serial.print("Moving to valid angle: ");
-     Serial.print(targetAngle);
-     Serial.println("°");
-   
-     testServo.write(targetAngle);
-   }
-   else {
-     // Reject any values out of bounds (like 0, 180, or random letters)
-     Serial.print("REJECTED: ");
-     Serial.print(inputString);
-     Serial.println(" is out of bounds! Please enter an angle strictly between 45 and 135.");
-   }
- }
+  // Check if 1 second (1000 milliseconds) has passed
+  if (millis() - lastUpdate >= 1000) {
+    lastUpdate = millis();
+
+
+    // Print current status to Serial Monitor
+    Serial.print("Target Speed: ");
+    Serial.println(currentSpeed);
+
+
+    // Set motor direction and speed
+    setMotor(currentSpeed);
+
+
+    // Update speed for the next second
+    currentSpeed += stepAmount;
+
+
+    // Bounce back logic: if it goes past -255 or +255, reverse the direction of the step
+    if (currentSpeed <= -255) {
+      currentSpeed = -255;
+      stepAmount = 50; // Start increasing
+    } else if (currentSpeed >= 255) {
+      currentSpeed = 255;
+      stepAmount = -50; // Start decreasing
+    }
+  }
 }
+
+
+// Helper function to drive the motor
+void setMotor(int speed) {
+  // Absolute value for PWM duty cycle
+  int pwmValue = abs(speed); 
+
+
+  if (speed > 0) {
+    // Forward
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+    analogWrite(PWM_PIN, pwmValue);
+  } else if (speed < 0) {
+    // Reverse
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, HIGH);
+    analogWrite(PWM_PIN, pwmValue);
+  } else {
+    // Brake/Stop
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, LOW);
+    analogWrite(PWM_PIN, 0);
+  }
+}
+
+
+

@@ -11,9 +11,9 @@
 
 
 // Left Motor Pins
-#define MOTOR_IN1  27
-#define MOTOR_IN2  14
-#define MOTOR_PWM  12
+#define MOTOR_IN1  25
+#define MOTOR_IN2  26
+#define MOTOR_PWM  33
 
 
 // I2C Multiplexer Channels (HW-617)
@@ -116,33 +116,17 @@ return event.orientation.x;
 // ==========================================
 //            ACTUATOR FUNCTIONS
 // ==========================================
-void setMotorOutputs(int Speed) {
-if (leftSpeed >= 0) {
-  //Forward motion
-  digitalWrite(MOTOR_IN1, HIGH);
-  digitalWrite(MOTOR_IN2, LOW);
-} else {
-  //Backward motion
-  digitalWrite(MOTOR_L_IN1, LOW);
-  digitalWrite(MOTOR_L_IN2, HIGH);
-  leftSpeed = -leftSpeed;
+void setMotorOutput(int speed) {
+  if (speed >= 0) {
+    digitalWrite(MOTOR_IN1, HIGH);
+    digitalWrite(MOTOR_IN2, LOW);
+  } else {
+    digitalWrite(MOTOR_IN1, LOW);
+    digitalWrite(MOTOR_IN2, HIGH);
+    speed = -speed; // Convert negative to positive for PWM calculation
+  }
+  analogWrite(MOTOR_PWM, constrain(speed, 0, 255));
 }
-
-
-if (rightSpeed >= 0) {
-  digitalWrite(MOTOR_R_IN1, HIGH);
-  digitalWrite(MOTOR_R_IN2, LOW);
-} else {
-  digitalWrite(MOTOR_R_IN1, LOW);
-  digitalWrite(MOTOR_R_IN2, HIGH);
-  rightSpeed = -rightSpeed;
-}
-
-
-analogWrite(MOTOR_L_PWM, constrain(leftSpeed, 0, 255));
-analogWrite(MOTOR_R_PWM, constrain(rightSpeed, 0, 255));
-}
-
 
 // ==========================================
 //           BEHAVIOR LOGIC MODES
@@ -212,8 +196,7 @@ void checkObstacles() {
 
 
 void driveStraightMode(float currentHeading) {
-setMotorOutputs(STRAIGHT_SPEED, STRAIGHT_SPEED);
-
+setMotorOutput(STRAIGHT_SPEED);
 
 headingError = straightTargetHeading - currentHeading;
 if (headingError > 180.0)  headingError -= 360.0;
@@ -232,8 +215,7 @@ steeringServo.write(finalServoAngle);
 
 
 void executeTurnMode(float currentHeading) {
-setMotorOutputs(TURN_SPEED, TURN_SPEED);
-
+setMotorOutput(TURN_SPEED);
 
 // Calculate remaining angle to target
 angleDifference = currentHeading - turnTargetHeading;
@@ -325,8 +307,9 @@ Serial.begin(115200);
 Wire.begin(21, 22);
 
 
-pinMode(MOTOR_L_IN1, OUTPUT); pinMode(MOTOR_L_IN2, OUTPUT); pinMode(MOTOR_L_PWM, OUTPUT);
-pinMode(MOTOR_R_IN1, OUTPUT); pinMode(MOTOR_R_IN2, OUTPUT); pinMode(MOTOR_R_PWM, OUTPUT);
+pinMode(MOTOR_IN1, OUTPUT); 
+pinMode(MOTOR_IN2, OUTPUT); 
+pinMode(MOTOR_PWM, OUTPUT);
 
 
 steeringServo.attach(SERVO_PIN);
@@ -351,7 +334,7 @@ straightTargetHeading = getCurrentHeading();
 // ==========================================
 void loop() {
 if (currentState == ROBOT_STOPPED) {
-  setMotorOutputs(0, 0);
+  setMotorOutput(0);
   steeringServo.write(SERVO_CENTER);
   Serial.print("STATUS: Finished. Total Turns Executed: ");
   Serial.println(totalTurnsCount);
