@@ -1,0 +1,26 @@
+<annotation>
+	<folder>red</folder>
+	<filename>20260701_171025_377909.jpg</filename>
+	<path>C:\Users\Dell\Documents\Jewel\FutureEng\red\20260701_171025_377909.jpg</path>
+	<source>
+		<database>Unknown</database>
+	</source>
+	<size>
+		<width>1920</width>
+		<height>1080</height>
+		<depth>3</depth>
+	</size>
+	<segmented>0</segmented>
+	<object>
+		<name>red</name>
+		<pose>Unspecified</pose>
+		<truncated>1</truncated>
+		<difficult>0</difficult>
+		<bndbox>
+			<xmin>1755</xmin>
+			<ymin>167</ymin>
+			<xmax>1920</xmax>
+			<ymax>496</ymax>
+		</bndbox>
+	</object>
+</annotation>

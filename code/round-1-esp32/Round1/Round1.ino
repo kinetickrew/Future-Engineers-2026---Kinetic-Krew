@@ -11,15 +11,9 @@
 
 
 // Left Motor Pins
-#define MOTOR_L_IN1  27
-#define MOTOR_L_IN2  14
-#define MOTOR_L_PWM  12
-
-
-// Right Motor Pins
-#define MOTOR_R_IN1  25
-#define MOTOR_R_IN2  26
-#define MOTOR_R_PWM  32
+#define MOTOR_IN1  27
+#define MOTOR_IN2  14
+#define MOTOR_PWM  12
 
 
 // I2C Multiplexer Channels (HW-617)
@@ -38,6 +32,7 @@
 const float SLOW_STEER_THRESHOLD = 45.0; // Angle (in degrees) where the servo starts returning to center
 const int STRAIGHT_SPEED = 255;  // Cruise speed for driving straight (0-255)
 const int TURN_SPEED     = 180;  // Controlled speed for turning to prevent overshooting
+const int BACKWARD_SPEED = -255; // Speed for backing up (if needed)
 
 
 const int SERVO_CENTER   = 90;   // Dead-center steering alignment
@@ -121,11 +116,13 @@ return event.orientation.x;
 // ==========================================
 //            ACTUATOR FUNCTIONS
 // ==========================================
-void setMotorOutputs(int leftSpeed, int rightSpeed) {
+void setMotorOutputs(int Speed) {
 if (leftSpeed >= 0) {
-  digitalWrite(MOTOR_L_IN1, HIGH);
-  digitalWrite(MOTOR_L_IN2, LOW);
+  //Forward motion
+  digitalWrite(MOTOR_IN1, HIGH);
+  digitalWrite(MOTOR_IN2, LOW);
 } else {
+  //Backward motion
   digitalWrite(MOTOR_L_IN1, LOW);
   digitalWrite(MOTOR_L_IN2, HIGH);
   leftSpeed = -leftSpeed;
@@ -391,4 +388,4 @@ else if (currentState == TURNING) {
 printTelemetry(currentHeading);
 delay(30);
 }
-z
+

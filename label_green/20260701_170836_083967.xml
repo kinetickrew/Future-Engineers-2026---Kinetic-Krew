@@ -1,0 +1,26 @@
+<annotation>
+	<folder>green</folder>
+	<filename>20260701_170836_083967.jpg</filename>
+	<path>C:\Users\Dell\Documents\Jewel\FutureEng\green\20260701_170836_083967.jpg</path>
+	<source>
+		<database>Unknown</database>
+	</source>
+	<size>
+		<width>1920</width>
+		<height>1080</height>
+		<depth>3</depth>
+	</size>
+	<segmented>0</segmented>
+	<object>
+		<name>green</name>
+		<pose>Unspecified</pose>
+		<truncated>0</truncated>
+		<difficult>0</difficult>
+		<bndbox>
+			<xmin>710</xmin>
+			<ymin>406</ymin>
+			<xmax>888</xmax>
+			<ymax>673</ymax>
+		</bndbox>
+	</object>
+</annotation>
