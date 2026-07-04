@@ -1,6 +1,6 @@
-# KineticKrew-FutureEngineer-2026 Skeleton Repository
+# KineticKrew Future Engineers 2026
 
-This repository is a skeleton clone of the structure used by the KineticKrew Future Engineers project. It contains the same top-level folders and placeholders, but no actual project data, images, CAD files, or compiled code.
+This repository contains the project files, code, CAD assets, and documentation for the KineticKrew Future Engineers 2026 robot. The current system uses an ESP32 for low-level control and a Raspberry Pi 5 for higher-level processing, vision, and coordination.
 
 ## Table of Contents
 
@@ -12,19 +12,20 @@ This repository is a skeleton clone of the structure used by the KineticKrew Fut
 
 ## 1. Overview
 
-This workspace is prepared as an empty repository layout for the Future Engineers project. Use this repo as the starting point for:
+This repository is used for the development and documentation of the Future Engineers project. It includes:
 
-- adding robotics design files
-- populating code for Round 1 ESP32 and Round 2 Raspberry Pi
-- adding documentation, images, and build instructions
-- tracking progress with TODO notes in the README
+- robotics design files and CAD assets
+- firmware and control code for the ESP32
+- software for the Raspberry Pi 5
+- documentation, images, and build instructions
+- progress notes and hardware references for the team
 
 ## 2. Architecture
 
-The robot architecture is split into two rounds, with dedicated code folders for each stage:
+The robot architecture is split into two main layers:
 
 - Round 1: `code/round-1-esp32/`
-  - Contains ESP32 Arduino firmware and sensor/control code for:
+  - Contains ESP32-based Arduino firmware and sensor/control code for:
     - distance sensor
     - IMU
     - motor driver
@@ -32,9 +33,9 @@ The robot architecture is split into two rounds, with dedicated code folders for
     - steering servo
   - Uses a TCA9548A I2C MUX module to connect the TF-LUNA and BNO055 to the ESP32 on shared I2C lines.
 - Round 2: `code/round-2-raspberry-pi/`
-  - Contains Raspberry Pi image processing code and control logic that sends commands to the ESP32.
+  - Contains Raspberry Pi 5 software for image processing, camera handling, decision-making, and control logic that sends commands to the ESP32.
 - Shared code and utilities: `code/shared/`
-  - Contains any common modules, communication helpers, or libraries used by both rounds.
+  - Contains common modules, communication helpers, and libraries used by both layers.
 
 ### 3. Hardware Specifications
 
@@ -82,6 +83,13 @@ The robot architecture is split into two rounds, with dedicated code folders for
   * **Communication Interface:** I²C
   * **Channels:** 8 independent I²C channels
   * **Description:** Enables multiple I²C devices to communicate with the ESP32 by eliminating address conflicts on the shared I²C bus.
+
+* **Camera – Lenovo FHD USB Webcam (4XC1B34802)**
+
+  * **Connection:** USB webcam
+  * **Resolution:** Full HD
+  * **Use:** Vision input for Raspberry Pi 5 image processing and object tracking
+  * **Description:** Provides live video feed for the onboard computer vision pipeline.
 
 
 ## 4. Repository Structure
