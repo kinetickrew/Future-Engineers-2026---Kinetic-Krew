@@ -15,6 +15,7 @@ void setup() {
   pinMode(IN1, OUTPUT);
   pinMode(IN2, OUTPUT);
   pinMode(PWM_PIN, OUTPUT);
+    
   
   Serial.begin(115200);
   Serial.println("Motor Test Initialized. Starting at 255...");
