@@ -3,7 +3,7 @@ import numpy as np
 import onnxruntime as ort
 
 # ── CONFIG ──
-MODEL_PATH  = '/Users/KanavC/Desktop/Future Engineers 2026 - Kinetic Krew/Python - Nerual/best224.onnx'
+MODEL_PATH  = '/home/pi/Desktop/Future-Engineers-2026---Kinetic-Krew/Python_Neu/best224.onnx'
 LABELS      = ['green', 'red']
 COLORS      = [(0, 255, 0), (0, 0, 255)]  # green, red
 CONF_THRESH = 0.6
@@ -81,7 +81,6 @@ def draw(frame, boxes):
 
 # ── Main loop ──
 cap = cv2.VideoCapture(0)
-
 if not cap.isOpened():
     print("Cannot open camera")
     exit()

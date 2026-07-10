@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 
 # Open the webcam
-cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
+cap = cv2.VideoCapture(0)
 
 if not cap.isOpened():
     print("Error: Could not open webcam.")

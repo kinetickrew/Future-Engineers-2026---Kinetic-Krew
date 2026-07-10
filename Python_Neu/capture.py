@@ -5,8 +5,8 @@ from datetime import datetime
 # ==========================
 # CHANGE THESE PATHS
 # ==========================
-RED_FOLDER = r"/Users/KanavC/Desktop/Future Engineers 2026 - Kinetic Krew/Red"
-GREEN_FOLDER = r"/Users/KanavC/Desktop/Future Engineers 2026 - Kinetic Krew/Green"
+RED_FOLDER = r"/home/pi/Desktop/Future-Engineers-2026---Kinetic-Krew/Red"
+GREEN_FOLDER = r"/home/pi/Desktop/Future-Engineers-2026---Kinetic-Krew/Green"
 # ==========================
 
 os.makedirs(RED_FOLDER, exist_ok=True)
