@@ -26,6 +26,7 @@ def white_balance_gray_world(img):
 
 
 def is_pillar_shaped(contour, min_aspect_ratio=1.2, min_solidity=0.85):
+    """Rejects noisy blobs that pass the color mask but aren't pillar-shaped."""
     x, y, w, h = cv2.boundingRect(contour)
     if w == 0:
         return False
@@ -35,6 +36,43 @@ def is_pillar_shaped(contour, min_aspect_ratio=1.2, min_solidity=0.85):
     hull_area = cv2.contourArea(hull)
     solidity = contour_area / float(hull_area) if hull_area > 0 else 0
     return aspect_ratio >= min_aspect_ratio and solidity >= min_solidity
+
+
+def compute_confidence(contour, hsv_frame, low_arr, high_arr, ideal_aspect_ratio=2.0):
+    """
+    Composite 0-100% confidence score combining:
+    - Solidity (40%): how solid/convex the blob is vs. ragged noise
+    - Aspect ratio fit (30%): how close to an ideal elongated pillar shape,
+      not just barely above the minimum
+    - Color centrality (30%): how deep into the S/V threshold range the
+      object's actual pixels sit, vs. just barely scraping past the edge
+    This is a heuristic score, not a statistical probability -- there's
+    no ground truth to calibrate against, but it's useful for relatively
+    ranking how trustworthy a detection is.
+    """
+    x, y, w, h = cv2.boundingRect(contour)
+    aspect_ratio = h / float(w) if w > 0 else 0
+    aspect_score = np.clip((aspect_ratio - 1.0) / (ideal_aspect_ratio - 1.0), 0, 1)
+
+    contour_area = cv2.contourArea(contour)
+    hull = cv2.convexHull(contour)
+    hull_area = cv2.contourArea(hull)
+    solidity = contour_area / float(hull_area) if hull_area > 0 else 0
+
+    obj_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
+    cv2.drawContours(obj_mask, [contour], -1, 255, -1)
+    mean_h, mean_s, mean_v = cv2.mean(hsv_frame, mask=obj_mask)[:3]
+
+    s_center = (int(low_arr[1]) + int(high_arr[1])) / 2.0
+    v_center = (int(low_arr[2]) + int(high_arr[2])) / 2.0
+    s_half_range = (int(high_arr[1]) - int(low_arr[1])) / 2.0 + 1e-6
+    v_half_range = (int(high_arr[2]) - int(low_arr[2])) / 2.0 + 1e-6
+    s_score = 1 - min(abs(mean_s - s_center) / s_half_range, 1.0)
+    v_score = 1 - min(abs(mean_v - v_center) / v_half_range, 1.0)
+    color_score = (s_score + v_score) / 2.0
+
+    confidence = (0.4 * solidity + 0.3 * aspect_score + 0.3 * color_score) * 100
+    return int(round(confidence))
 
 
 while True:
@@ -58,19 +96,14 @@ while True:
     low_red2 = np.array([172, 140, 100])
     high_red2 = np.array([180, 255, 255])
 
-    # GREEN: RECALIBRATE using the updated hsv_calibrator.py (now with white
-    # balance + CLAHE applied) -- your old numbers [32,37,0]-[88,137,158]
-    # were found on the raw uncorrected feed and won't be right anymore.
-    low_green = np.array([32, 37, 0])
-    high_green = np.array([88, 137, 158])
-
-    low_pink = np.array([160, 150, 100])
-    high_pink = np.array([172, 255, 255])
+    # RECALIBRATE with the updated hsv_calibrator.py (white balance + CLAHE
+    # applied) -- don't reuse numbers found on the raw uncorrected feed.
+    low_green = np.array([57, 0, 0])
+    high_green = np.array([79, 255, 255])
 
     # --- CREATE MASKS ---
     mask_red = cv2.inRange(hsv_frame, low_red1, high_red1) + cv2.inRange(hsv_frame, low_red2, high_red2)
     mask_green = cv2.inRange(hsv_frame, low_green, high_green)
-    mask_pink = cv2.inRange(hsv_frame, low_pink, high_pink)
 
     # --- MORPHOLOGICAL CLEANUP ---
     kernel = np.ones((5, 5), np.uint8)
@@ -80,32 +113,30 @@ while True:
     mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, kernel)
     mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_CLOSE, kernel)
 
-    mask_pink = cv2.morphologyEx(mask_pink, cv2.MORPH_OPEN, kernel)
-    mask_pink = cv2.morphologyEx(mask_pink, cv2.MORPH_CLOSE, kernel)
-
     # --- DETECT AND DRAW BOXES ---
     contours_red, _ = cv2.findContours(mask_red, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     contours_green, _ = cv2.findContours(mask_green, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    contours_pink, _ = cv2.findContours(mask_pink, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
+    # Process Red Objects
     for contour in contours_red:
-        if cv2.contourArea(contour) > 1500:
+        if cv2.contourArea(contour) > 1500 and is_pillar_shaped(contour):
+            conf = compute_confidence(contour, hsv_frame, low_red1, high_red1)
+            if conf < 60:
+                continue
             x, y, w, h = cv2.boundingRect(contour)
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
-            cv2.putText(frame, "RED PILLAR", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            cv2.putText(frame, f"RED PILLAR {conf}%", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
+    # Process Green Objects
     for contour in contours_green:
         if cv2.contourArea(contour) > 1500 and is_pillar_shaped(contour):
+            conf = compute_confidence(contour, hsv_frame, low_green, high_green)
+            if conf < 60:
+                continue
             hull = cv2.convexHull(contour)
             x, y, w, h = cv2.boundingRect(hull)
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            cv2.putText(frame, "GREEN PILLAR", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-    for contour in contours_pink:
-        if cv2.contourArea(contour) > 1500:
-            x, y, w, h = cv2.boundingRect(contour)
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (180, 0, 255), 2)
-            cv2.putText(frame, "PINK OBJECT", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 0, 255), 2)
+            cv2.putText(frame, f"GREEN PILLAR {conf}%", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
     cv2.imshow("Live Object Detection", frame)
 
