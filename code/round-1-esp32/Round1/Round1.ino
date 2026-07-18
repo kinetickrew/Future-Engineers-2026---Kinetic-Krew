@@ -30,23 +30,23 @@
 // ==========================================
 //          CONFIGURABLE VARIABLES
 // ==========================================
-const float SLOW_STEER_THRESHOLD = 45.0; // Angle (in degrees) where the servo starts returning to center
-const int STRAIGHT_SPEED = 255;  // Cruise speed for driving straight (0-255)
-const int TURN_SPEED     = 180;  // Controlled speed for turning to prevent overshooting
-const int BACKWARD_SPEED = -255; // Speed for backing up (if needed)
+const float SLOW_STEER_THRESHOLD = 75.0; // Angle (in degrees) where the servo starts returning to center
+const int STRAIGHT_SPEED = 90;  // Cruise speed for driving straight (0-255)
+const int TURN_SPEED     = 90;  // Controlled speed for turning to prevent overshooting
+const int BACKWARD_SPEED = -90; // Speed for backing up (if needed)
 
 
-const int SERVO_CENTER   = 90;   // Dead-center steering alignment
-const int SERVO_MAX_LEFT = 135;  // Physical mechanical limit for left turn
-const int SERVO_MAX_RIGHT= 45;   // Physical mechanical limit for right turn
+const int SERVO_CENTER   = 105;   // Dead-center steering alignment
+const int SERVO_MAX_LEFT = 140;  // Physical mechanical limit for left turn
+const int SERVO_MAX_RIGHT= 70;   // Physical mechanical limit for right turn
 
 
 // Change to true if your steering corrections move backwards during testing
-const bool INVERT_STEERING = false;
+const bool INVERT_STEERING = true;
 
 
-const float STEERING_KP  = 2.0;  // Sensitivity adjustment for straight-line micro-corrections
-const int SPIKE_THRESHOLD = 50;  // Trigger turning mode if sensor difference changes by this many cm
+const float STEERING_KP  = 0.0;  // Sensitivity adjustment for straight-line micro-corrections
+const int SPIKE_THRESHOLD = 100;  // Trigger turning mode if sensor difference changes by this many cm
 const int MAX_TURNS      = 12;   // Total number of turns allowed before tracking the final stop distance
 
 
@@ -67,7 +67,7 @@ float turnTargetHeading     = 0.0;
 bool isTurningLeft          = false;
 
 
-int totalTurnsCount         = 0;
+int totalTurnsCount         = 8;
 bool hasTurnedOnce          = false; // Becomes true permanently on the first turn
 bool lockedDirectionLeft    = false; // Remembers if our layout is strictly Left or Right
 
@@ -226,21 +226,20 @@ void executeTurnMode(float currentHeading) {
   float remainingAngle = abs(angleDifference);
 
 
+  int leftExtreme  = INVERT_STEERING ? SERVO_MAX_RIGHT : SERVO_MAX_LEFT;
+  int rightExtreme = INVERT_STEERING ? SERVO_MAX_LEFT  : SERVO_MAX_RIGHT;
+
   if (remainingAngle < SLOW_STEER_THRESHOLD) {
     float progressFactor = remainingAngle / SLOW_STEER_THRESHOLD;
     if (isTurningLeft) {
-      int maxOffset = SERVO_MAX_LEFT - SERVO_CENTER;
+      int maxOffset = leftExtreme - SERVO_CENTER;
       finalServoAngle = SERVO_CENTER + (int)(maxOffset * progressFactor);
     } else {
-      int maxOffset = SERVO_CENTER - SERVO_MAX_RIGHT;
+      int maxOffset = SERVO_CENTER - rightExtreme;
       finalServoAngle = SERVO_CENTER - (int)(maxOffset * progressFactor);
     }
   } else {
-    if (isTurningLeft) {
-      finalServoAngle = SERVO_MAX_LEFT;
-    } else {
-      finalServoAngle = SERVO_MAX_RIGHT;
-    }
+    finalServoAngle = isTurningLeft ? leftExtreme : rightExtreme;
   }
 
 
@@ -253,7 +252,7 @@ void executeTurnMode(float currentHeading) {
     finalServoAngle = SERVO_CENTER;
     straightTargetHeading = turnTargetHeading;
     currentState = DRIVING_STRAIGHT;
-    delay(150);
+    // delay(150);
   }
 }
 
@@ -385,4 +384,4 @@ void loop() {
 
   printTelemetry(currentHeading);
   delay(30);
-}		
+}
