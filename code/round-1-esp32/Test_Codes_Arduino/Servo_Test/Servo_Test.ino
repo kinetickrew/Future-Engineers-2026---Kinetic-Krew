@@ -34,7 +34,7 @@ void loop() {
    int targetAngle = inputString.toInt();
   
    // Validate if the input is within your precise safe limits
-   if (targetAngle >= 45 && targetAngle <= 135) {
+   if (targetAngle >= 0 && targetAngle <= 180) {
      Serial.print("Moving to valid angle: ");
      Serial.print(targetAngle);
      Serial.println("°");

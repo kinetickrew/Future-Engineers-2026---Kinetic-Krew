@@ -30,25 +30,34 @@
 // ==========================================
 //          CONFIGURABLE VARIABLES
 // ==========================================
-const float SLOW_STEER_THRESHOLD = 75.0; // Angle (in degrees) where the servo starts returning to center
-const int STRAIGHT_SPEED = 90;  // Cruise speed for driving straight (0-255)
-const int TURN_SPEED     = 90;  // Controlled speed for turning to prevent overshooting
-const int BACKWARD_SPEED = -90; // Speed for backing up (if needed)
+ float SLOW_STEER_THRESHOLD = 50.0; // Angle (in degrees) where the servo starts returning to center
+int STRAIGHT_SPEED = 150;  // Cruise speed for driving straight (0-255)
+int TURN_SPEED     = 150;  // Controlled speed for turning to prevent overshooting
+int BACKWARD_SPEED = -150; // Speed for backing up (if needed)
 
 
-const int SERVO_CENTER   = 105;   // Dead-center steering alignment
-const int SERVO_MAX_LEFT = 140;  // Physical mechanical limit for left turn
-const int SERVO_MAX_RIGHT= 70;   // Physical mechanical limit for right turn
-
+int SERVO_CENTER   = 90;   // Dead-center steering alignment
+int DIFF = 35; 
+int SERVO_MAX_LEFT = SERVO_CENTER + DIFF;  // Physical mechanical limit for left turn
+int SERVO_MAX_RIGHT= SERVO_CENTER - DIFF;   // Physical mechanical limit for right turn
 
 // Change to true if your steering corrections move backwards during testing
 const bool INVERT_STEERING = true;
 
 
-const float STEERING_KP  = 0.0;  // Sensitivity adjustment for straight-line micro-corrections
+const float STEERING_KP  = 1.2;   // Proportional gain — how hard it steers based on current error
+const float STEERING_KD  = 0.15 ;   // Derivative gain — how hard it "brakes" based on how fast error is changing
+const float HEADING_DEADBAND = 1.5;   // degrees — ignore jitter smaller than this
+const int   MAX_STEER_CORRECTION = 20; // clamp — no single correction can swing the servo too hard
 const int SPIKE_THRESHOLD = 100;  // Trigger turning mode if sensor difference changes by this many cm
 const int MAX_TURNS      = 12;   // Total number of turns allowed before tracking the final stop distance
 
+unsigned long turnCooldownUntil = 0;   // NEW: timestamp until which obstacle checks are ignored
+const unsigned long TURN_COOLDOWN_MS = 300; // tune this — how long to ignore after a turn
+
+// Cardinal heading snap table — every commanded turn target is forced onto one of these,
+// so sensor noise/drift can never leave the robot aiming at something like 250°.
+const float CARDINAL_HEADINGS[4] = {0.0, 90.0, 180.0, 270.0};
 
 // ==========================================
 //          GLOBAL STATE VARIABLES
@@ -67,7 +76,8 @@ float turnTargetHeading     = 0.0;
 bool isTurningLeft          = false;
 
 
-int totalTurnsCount         = 8;
+int totalTurnsCount         = 0
+;
 bool hasTurnedOnce          = false; // Becomes true permanently on the first turn
 bool lockedDirectionLeft    = false; // Remembers if our layout is strictly Left or Right
 
@@ -79,7 +89,8 @@ int16_t currentRightDist    = -1;
 int finalServoAngle         = 90;
 float headingError          = 0.0;
 float angleDifference       = 0.0;
-
+float lastHeadingError       = 0.0;   // NEW: needed to calculate the D term
+unsigned long lastHeadingTime = 0;    // NEW: for time-based derivative
 
 // ==========================================
 //            I2C & SENSOR FUNCTIONS
@@ -114,6 +125,60 @@ float getCurrentHeading() {
   return event.orientation.x;
 }
 
+float filteredHeading = 0.0;
+bool headingInitialized = false;
+
+float getSmoothedHeading() {
+  float raw = getCurrentHeading();
+  if (!headingInitialized) {
+    filteredHeading = raw;
+    headingInitialized = true;
+    return filteredHeading;
+  }
+
+  // Find the shortest angular distance from filtered to raw (handles the 0/360 wrap)
+  float diff = raw - filteredHeading;
+  if (diff > 180.0)  diff -= 360.0;
+  if (diff < -180.0) diff += 360.0;
+
+  filteredHeading += 0.2 * diff;   // same 0.8/0.2 blend, but wrap-safe
+  if (filteredHeading < 0.0)    filteredHeading += 360.0;
+  if (filteredHeading >= 360.0) filteredHeading -= 360.0;
+
+  return filteredHeading;
+}
+
+// ==========================================
+//        CARDINAL HEADING SNAP HELPER
+// ==========================================
+// Rounds any angle to the nearest of 0/90/180/270, wrapping correctly around 0/360.
+float snapToCardinal(float angle) {
+  angle = fmod(angle, 360.0);
+  if (angle < 0.0) angle += 360.0;
+
+  float best = CARDINAL_HEADINGS[0];
+  float bestDiff = 999.0;
+
+  for (int i = 0; i < 4; i++) {
+    float diff = fabs(angle - CARDINAL_HEADINGS[i]);
+    if (diff > 180.0) diff = 360.0 - diff; // shortest wrap-around distance
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = CARDINAL_HEADINGS[i];
+    }
+  }
+  return best;
+}
+
+// Computes a turn target: takes the raw current heading +/-90 depending on direction,
+// then snaps it onto the nearest cardinal so the robot always ends up aimed at
+// exactly 0, 90, 180, or 270 — never something drifted like 250.
+float computeTurnTarget(float currentHeading, bool turningLeft) {
+  float raw = turningLeft ? (currentHeading - 90.0) : (currentHeading + 90.0);
+  raw = fmod(raw, 360.0);
+  if (raw < 0.0) raw += 360.0;
+  return snapToCardinal(raw);
+}
 
 // ==========================================
 //            ACTUATOR FUNCTIONS
@@ -135,6 +200,7 @@ void setMotorOutput(int speed) {
 //             BEHAVIOR LOGIC MODES
 // ==========================================
 void checkObstacles() {
+  if (millis() < turnCooldownUntil) return;   // NEW: skip checking right after a turn
   if (currentLeftDist == -1 || currentRightDist == -1) return;
 
 
@@ -147,16 +213,14 @@ void checkObstacles() {
       if (difference > SPIKE_THRESHOLD) {
         float currentHeading = getCurrentHeading();
         isTurningLeft = true;
-        turnTargetHeading = currentHeading - 90.0;
-        if (turnTargetHeading < 0.0) turnTargetHeading += 360.0;
+        turnTargetHeading = computeTurnTarget(currentHeading, true);
         currentState = TURNING;
       }
     } else {
       if (difference < -SPIKE_THRESHOLD) {
         float currentHeading = getCurrentHeading();
         isTurningLeft = false;
-        turnTargetHeading = currentHeading + 90.0;
-        if (turnTargetHeading >= 360.0) turnTargetHeading -= 360.0;
+        turnTargetHeading = computeTurnTarget(currentHeading, false);
         currentState = TURNING;
       }
     }
@@ -168,8 +232,7 @@ void checkObstacles() {
   if (difference > SPIKE_THRESHOLD) {
     float currentHeading = getCurrentHeading();
     isTurningLeft = true;
-    turnTargetHeading = currentHeading - 90.0;
-    if (turnTargetHeading < 0.0) turnTargetHeading += 360.0;
+    turnTargetHeading = computeTurnTarget(currentHeading, true);
     hasTurnedOnce = true;
     lockedDirectionLeft = true;
    
@@ -182,8 +245,7 @@ void checkObstacles() {
   else if (difference < -SPIKE_THRESHOLD) {
     float currentHeading = getCurrentHeading();
     isTurningLeft = false;
-    turnTargetHeading = currentHeading + 90.0;
-    if (turnTargetHeading >= 360.0) turnTargetHeading -= 360.0;
+    turnTargetHeading = computeTurnTarget(currentHeading, false);
     hasTurnedOnce = true;
     lockedDirectionLeft = false;
    
@@ -199,13 +261,30 @@ void checkObstacles() {
 void driveStraightMode(float currentHeading) {
   setMotorOutput(STRAIGHT_SPEED);
 
+  float rawError = straightTargetHeading - currentHeading;
+  if (rawError > 180.0)  rawError -= 360.0;
+  if (rawError < -180.0) rawError += 360.0;
 
-  headingError = straightTargetHeading - currentHeading;
-  if (headingError > 180.0)  headingError -= 360.0;
-  if (headingError < -180.0) headingError += 360.0;
+  headingError = rawError; // keep raw value for telemetry + rate calc (no snapping to 0)
 
+  // D term: real rate of change (degrees per second), computed from the RAW error
+  // so it never sees a fake jump caused by the deadband
+  unsigned long now = millis();
+  float dt = (now - lastHeadingTime) / 1000.0;
+  if (dt < 0.001) dt = 0.001;
 
-  int steeringCorrection = (int)(headingError * STEERING_KP);
+  float errorRate = (rawError - lastHeadingError) / dt;
+
+  // Deadband only affects the P term — small noise doesn't trigger a steering push,
+  // but the D term still sees smooth, continuous data
+  float pTermInput = (abs(rawError) < HEADING_DEADBAND) ? 0.0 : rawError;
+
+  int steeringCorrection = (int)(pTermInput * STEERING_KP + errorRate * STEERING_KD);
+  steeringCorrection = constrain(steeringCorrection, -MAX_STEER_CORRECTION, MAX_STEER_CORRECTION);
+
+  lastHeadingError = rawError;
+  lastHeadingTime = now;
+
   if (INVERT_STEERING) {
     finalServoAngle = SERVO_CENTER + steeringCorrection;
   } else {
@@ -247,12 +326,12 @@ void executeTurnMode(float currentHeading) {
 
 
   if (remainingAngle < 6.0) {
-    totalTurnsCount++;
-    steeringServo.write(SERVO_CENTER);
-    finalServoAngle = SERVO_CENTER;
-    straightTargetHeading = turnTargetHeading;
-    currentState = DRIVING_STRAIGHT;
-    // delay(150);
+  totalTurnsCount++;
+  steeringServo.write(SERVO_CENTER);
+  finalServoAngle = SERVO_CENTER;
+  straightTargetHeading = turnTargetHeading;
+  currentState = DRIVING_STRAIGHT;
+  turnCooldownUntil = millis() + TURN_COOLDOWN_MS;   // NEW
   }
 }
 
@@ -317,7 +396,6 @@ void setup() {
   Wire.begin(21, 22);
   SerialBT.begin("ESP32_Robot_Telemetry");
 
-
   pinMode(MOTOR_IN1, OUTPUT);
   pinMode(MOTOR_IN2, OUTPUT);
   pinMode(MOTOR_PWM, OUTPUT);
@@ -364,7 +442,7 @@ void loop() {
   currentRightDist  = getLunaDistance(MUX_CH_RIGHT);
 
 
-  float currentHeading = getCurrentHeading();
+  float currentHeading = getSmoothedHeading();
 
 
   if (totalTurnsCount >= MAX_TURNS && currentCenterDist > 0 && currentCenterDist < 165) {
@@ -383,5 +461,5 @@ void loop() {
 
 
   printTelemetry(currentHeading);
-  delay(30);
+  delay(20);
 }
