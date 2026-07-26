@@ -7,7 +7,7 @@
 
 // ==========================================
 //           PIN & HARDWARE DEFINITIONS
-// ==========================================
+// ========================================== 
 #define SERVO_PIN 13
 
 
@@ -21,7 +21,7 @@
 #define MUX_CH_LEFT   0
 #define MUX_CH_CENTER 1  // New Center LiDAR channel
 #define MUX_CH_RIGHT  2
-#define MUX_CH_BNO    4
+#define MUX_CH_BNO    5
 
 
 #define TFLUNA_I2C_ADDR 0x10
