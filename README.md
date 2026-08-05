@@ -1,140 +1,88 @@
-# KineticKrew Future Engineers 2026
+# Kinetic Krew - Future Engineers 2026
 
-This repository contains the project files, code, CAD assets, and documentation for the KineticKrew Future Engineers 2026 robot. The current system uses an ESP32 for low-level control and a Raspberry Pi 5 for higher-level processing, vision, and coordination.
+This repository contains the hardware design, firmware, vision pipeline, and documentation for the Kinetic Krew robot built for the Future Engineers 2026 competition. The project is organized around two main layers:
 
-## Table of Contents
+- an ESP32-based control layer for low-level sensing and actuation
+- a Raspberry Pi based perception and decision layer for vision and high-level behavior
 
-1. Overview
-2. Architecture
-3. Repository Structure
-4. Missing TODO Items
-5. Notes
+## Project overview
 
-## 1. Overview
+The repository now groups files by function so the robot stack is easier to navigate:
 
-This repository is used for the development and documentation of the Future Engineers project. It includes:
+- Mechanical and CAD assets live in CAD-Files and Slicer-Files
+- Firmware and embedded control code live in code/round-1-esp32
+- Raspberry Pi code and round-two software live in code/round-2-raspberry-pi
+- Vision datasets, annotations, scripts, and trained model assets live in data/ and tools/vision
+- Photos, videos, and supporting documentation live in media/ and docs/
 
-- robotics design files and CAD assets
-- firmware and control code for the ESP32
-- software for the Raspberry Pi 5
-- documentation, images, and build instructions
-- progress notes and hardware references for the team
+## Repository structure
 
-## 2. Architecture
+```text
+.
+├── CAD-Files/              # CAD and mechanical design files
+├── Slicer-Files/           # 3D print project files and slicer settings
+├── code/
+│   ├── round-1-esp32/      # ESP32 firmware and experiments
+│   ├── round-2-raspberry-pi/  # Raspberry Pi applications and round-2 code
+│   └── shared/             # Shared helpers and reusable modules
+├── data/
+│   ├── datasets/           # exported datasets and training bundles
+│   └── vision/             # images and annotations for object detection
+├── docs/                   # project documentation and resources
+├── media/                  # photos and videos for documentation and presentations
+├── other/                  # miscellaneous notes and utility references
+├── tools/vision/           # vision scripts, notebooks, and model assets
+└── README.md
+```
 
-The robot architecture is split into two main layers:
+## Hardware and software focus
 
-- Round 1: `code/round-1-esp32/`
-  - Contains ESP32-based Arduino firmware and sensor/control code for:
-    - distance sensor
-    - IMU
-    - motor driver
-    - DC motors
-    - steering servo
-  - Uses a TCA9548A I2C MUX module to connect the TF-LUNA and BNO055 to the ESP32 on shared I2C lines.
-- Round 2: `code/round-2-raspberry-pi/`
-  - Contains Raspberry Pi 5 software for image processing, camera handling, decision-making, and control logic that sends commands to the ESP32.
-- Shared code and utilities: `code/shared/`
-  - Contains common modules, communication helpers, and libraries used by both layers.
+### Embedded control layer
 
-### 3. Hardware Specifications
+The ESP32 side is centered around the round-1 firmware in code/round-1-esp32. It handles:
 
-* **Distance Sensor – Benewake TF-LUNA Micro LiDAR**
+- sensor polling and telemetry reporting
+- motor and steering actuation
+- serial communication with the Raspberry Pi
 
-  * **Power Requirement:** 5 V DC, approximately 180 mA
-  * **Communication Interface:** UART
-  * **Operating Range:** 0.2–8 m
-  * **Degrees of Freedom:** 1 (distance measurement)
-  * **Description:** Used for real-time obstacle detection by measuring the distance between the vehicle and surrounding objects.
+### Vision and autonomy layer
 
-* **Inertial Measurement Unit (IMU) – BNO055**
+The Raspberry Pi side in code/round-2-raspberry-pi contains the round-two software stack for:
 
-  * **Power Requirement:** 3.3 V DC, approximately 12 mA
-  * **Communication Interface:** I²C
-  * **Degrees of Freedom:** 9 DoF
-  * **Description:** Provides fused orientation, acceleration, gyroscope, and magnetometer data for vehicle localization and motion estimation.
+- camera input and image processing
+- object detection and pillar tracking
+- high-level navigation decisions
 
-* **Motor Driver – TB6612FNG**
+The vision assets in data/vision and tools/vision support training and testing for the detection pipeline.
 
-  * **Power Requirement:** 5 V logic, 4.5–13.5 V motor supply, up to 1.2 A per channel
-  * **Communication Interface:** PWM
-  * **Motor Outputs:** 2 channels
-  * **Description:** Controls the speed and direction of the DC drive motors using PWM signals.
+## Key folders
 
-* **DC Drive Motor – BO Motor**
+- CAD-Files/: mechanical design files
+- Slicer-Files/: printable parts and print preparation assets
+- code/round-1-esp32/: firmware and Arduino experiments
+- code/round-2-raspberry-pi/: Raspberry Pi application code
+- data/vision/: image and annotation data for vision training
+- tools/vision/: scripts, notebooks, and model files
+- docs/: documentation and supporting resources
+- media/: photos and videos
 
-  * **Operating Voltage:** 6–12 V DC
-  * **Control Method:** PWM
-  * **Typical Speed:** 200–300 RPM
-  * **Degrees of Freedom:** 1 rotational axis
-  * **Description:** Provides propulsion for the autonomous vehicle. The actual speed depends on the supplied voltage and mechanical load.
+## Getting started
 
-* **Steering Servo Motor – MG90S**
+1. Open the relevant folder for the subsystem you are working on.
+2. Use the ESP32 code under code/round-1-esp32 for embedded behavior.
+3. Use the Raspberry Pi code under code/round-2-raspberry-pi for higher-level control.
+4. For vision work, use the scripts and model assets in tools/vision with the data in data/vision.
 
-  * **Power Requirement:** 5 V DC, 500–900 mA (stall current)
-  * **Communication Interface:** PWM
-  * **Operating Speed:** Approximately 0.2 s per 60°
-  * **Degrees of Freedom:** 1 rotational axis
-  * **Description:** A metal-gear servo motor with approximately 180° rotation, used for precise front-wheel steering.
+## Notes
 
-* **I²C Multiplexer – TCA9548A**
+- This repository is actively being organized and expanded.
+- If you add new source files, keep them in the most relevant subsystem folder.
+- When adding data or media, prefer placing it in data/ or media/ rather than keeping it at the repository root.
 
-  * **Power Requirement:** 3.3 V / 5 V logic
-  * **Communication Interface:** I²C
-  * **Channels:** 8 independent I²C channels
-  * **Description:** Enables multiple I²C devices to communicate with the ESP32 by eliminating address conflicts on the shared I²C bus.
+## Suggested next steps
 
-* **Camera – Lenovo FHD USB Webcam (4XC1B34802)**
+- add a LICENSE file
+- add a CHANGELOG file
+- add CI or automation workflows under .github/
+- document the hardware wiring and software setup in docs/
 
-  * **Connection:** USB webcam
-  * **Resolution:** Full HD
-  * **Use:** Vision input for Raspberry Pi 5 image processing and object tracking
-  * **Description:** Provides live video feed for the onboard computer vision pipeline.
-
-
-## 4. Repository Structure
-
-The current skeleton includes these directories:
-
-- `.github/workflows/`
-- `FreeCAD-Files/`
-- `Slicer-Files/`
-- `code/`
-  - `round-1-esp32/`
-    - `Test_Codes_Arduino/`
-  - `round-2-raspberry-pi/`
-    - `raspberry-pi-5/`
-  - `shared/`
-- `docs/resources/`
-- `other/`
-- `t-photos/`
-- `v-photos/`
-- `video/`
-
-The structure now uses round-specific folders for ESP32 and Raspberry Pi development, with a shared folder for any common code or utilities.
-
-## 3. Missing TODO Items
-
-This repository is intentionally empty. The following content still needs to be added:
-
-- Add GitHub Actions workflows in `.github/workflows/`
-- Add FreeCAD assembly and part files in `FreeCAD-Files/`
-- Add slicer project files and print settings in `Slicer-Files/`
-- Add firmware and application source code in `code/raspberry-pi-5/` and `code/raspberry-pi-pico-2/`
-- Add shared library/source code in `code/shared/`
-- Add documentation images and resource files in `docs/resources/`
-- Add `other/dhcp-server-on-ethernet-port.md` and `other/image-drive-linux.md`
-- Add team photos and presentation media in `t-photos/`, `v-photos/`, and `video/`
-- Add a project changelog in `CHANGELOG.md`
-- Add an appropriate license in `LICENSE`
-- Add `.gitignore`, `.gitattributes`, `.clang-format`, and `.gitmodules` if needed
-- Fill in the major README sections:
-  - Overview
-  - Mobility Management
-  - Power and Sense Management
-  - Obstacle Management
-  - Source Code
-  - List of Components
-  - 3D Model Files
-  - Building Instructions
-  - Extras
