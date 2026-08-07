@@ -41,6 +41,10 @@ int STRAIGHT_SPEED = 150;  // Cruise speed for driving straight (0-255)
 int TURN_SPEED     = 150;  // Controlled speed for turning to prevent overshooting
 int BACKWARD_SPEED = -150; // Speed for backing up (if needed)
 
+const int RAMP_START_SPEED = 30;
+const int RAMP_STEP = 30;
+const unsigned long RAMP_DURATION_MS = 2000;
+
 
 int SERVO_CENTER   = 70;   // Dead-center steering alignment
 int DIFF = 25; 
@@ -113,6 +117,10 @@ float angleDifference       = 0.0;
 float lastHeadingError       = 0.0;
 float integralError          = 0.0;   // NEW: running total of error over time
 unsigned long lastHeadingTime = 0;    // NEW: for time-based derivative
+
+// ---- Speed ramp-up state ----
+unsigned long driveStartTime = 0;   // when the very first straight-drive began
+bool rampActive = false;            // true while we're still ramping up from a stand-still
 
 // ==========================================
 //            I2C & SENSOR FUNCTIONS
@@ -222,6 +230,32 @@ void setMotorOutput(int speed) {
   analogWrite(MOTOR_PWM, constrain(speed, 0, 255));
 }
 
+// ==========================================
+//          SPEED RAMP-UP HELPER
+// ==========================================
+// On the very first start (t=0), speed climbs in RAMP_STEP increments from
+// RAMP_START_SPEED up to STRAIGHT_SPEED over RAMP_DURATION_MS, so the car
+// doesn't dump full torque instantly and pop a wheelie off the line.
+int getRampedSpeed() {
+  if (!rampActive) return STRAIGHT_SPEED;
+
+  unsigned long elapsed = millis() - driveStartTime;
+
+  if (elapsed >= RAMP_DURATION_MS) {
+    rampActive = false;           // ramp finished — stop computing it every loop
+    return STRAIGHT_SPEED;
+  }
+
+  // How many 30-speed steps fit between RAMP_START_SPEED and STRAIGHT_SPEED
+  int numSteps = max(1, (STRAIGHT_SPEED - RAMP_START_SPEED) / RAMP_STEP);
+  unsigned long stepDuration = RAMP_DURATION_MS / numSteps;
+
+  int stepIndex = elapsed / stepDuration;
+  int speed = RAMP_START_SPEED + stepIndex * RAMP_STEP;
+
+  return constrain(speed, RAMP_START_SPEED, STRAIGHT_SPEED);
+}
+
 
 // ==========================================
 //             BEHAVIOR LOGIC MODES
@@ -286,7 +320,7 @@ void checkObstacles() {
 
 
 void driveStraightMode(float currentHeading) {
-  setMotorOutput(STRAIGHT_SPEED);
+  setMotorOutput(getRampedSpeed());
 
   float rawError = straightTargetHeading - currentHeading;
   if (rawError > 180.0)  rawError -= 360.0;
@@ -729,6 +763,10 @@ void setup() {
   Serial.println("Calibration wait done.");
 
   straightTargetHeading = getCurrentHeading();
+
+  // Begin the speed ramp for the very first start from a stand-still
+  driveStartTime = millis();
+  rampActive = true;
 }
 
 

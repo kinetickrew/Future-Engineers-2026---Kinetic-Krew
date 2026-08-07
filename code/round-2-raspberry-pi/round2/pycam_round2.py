@@ -1,656 +1,657 @@
-import cv2
-import numpy as np
-import serial
+#!/usr/bin/env python3
+
 import time
+import threading
+import queue
+import subprocess
+import re
+import serial
+import numpy as np
+import cv2
+import av
+from collections import deque
+from PIL import Image
+# Danger zone – only react to blocks in the middle of the frame
+DANGER_LEFT  = 70
+DANGER_RIGHT = 170
+REVERSE_HEIGHT = 80  # if block is below this y, reverse instead of swerve
+DETECTION_LINE_RATIO = 0.5  # blocks detected only when midpoint is below this y
+            # --- Thresholds for determining which side the block is on ---
+LEFT_SIDE_MAX   = 90   # pixel x < this = left side
+RIGHT_SIDE_MIN  = 150   # pixel x > this = right side
+
+
+def box_below_detection_line(box: dict, line_y: int) -> dict:
+    """Return the box only if its midpoint is at or below the detection line."""
+    if box is None or box['center_y'] < line_y:
+        return None
+    return box
+
+
+def rgb_to_lab(frame: np.ndarray) -> np.ndarray:
+    """Convert RGB to LAB color space."""
+    rgb = frame.astype(np.float32) / 255.0
+    mask = rgb > 0.04045
+    linear = np.where(mask, ((rgb + 0.055) / 1.055) ** 2.4, rgb / 12.92)
+    M = np.array([
+        [0.4124564, 0.3575761, 0.1804375],
+        [0.2126729, 0.7151522, 0.0721750],
+        [0.0193339, 0.1191920, 0.9503041],
+    ], dtype=np.float32)
+    xyz = linear @ M.T
+    xyz = xyz / np.array([0.95047, 1.0, 1.08883], dtype=np.float32)
+    delta = 6.0 / 29.0
+    f = np.where(xyz > delta ** 3, np.cbrt(xyz), xyz / (3 * delta ** 2) + 4.0 / 29.0)
+    fx, fy, fz = f[..., 0], f[..., 1], f[..., 2]
+
+    L = 116.0 * fy - 16.0
+    a = 500.0 * (fx - fy)
+    b = 200.0 * (fy - fz)
+
+    return np.stack([L, a, b], axis=-1)
+
+
+def get_masks(lab: np.ndarray, calib: dict) -> tuple:
+    L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+    chroma = np.sqrt(a ** 2 + b ** 2)
+    min_chroma = 10.0
+
+    red = calib.get('red')
+    green = calib.get('green')
+
+    red_mask = np.zeros(L.shape, dtype=bool)
+    green_mask = np.zeros(L.shape, dtype=bool)
+
+    if red is not None:
+        dist = np.sqrt((a - red['a_center']) ** 2 + (b - red['b_center']) ** 2)
+        red_mask = (dist < red['tol']) & (L > red['l_min']) & (chroma > min_chroma)
+
+    if green is not None:
+        dist = np.sqrt((a - green['a_center']) ** 2 + (b - green['b_center']) ** 2)
+        green_mask = (dist < green['tol']) & (L > green['l_min']) & (chroma > min_chroma)
+
+    return red_mask, green_mask
+
+
+def extract_bounding_box(mask: np.ndarray, min_area: int = 60, min_extent: float = 0.55) -> dict:
+    """Finds the largest connected blob in the mask and returns its box."""
+    from scipy import ndimage
+
+    if mask.sum() < min_area:
+        return None
+
+    labeled, n_components = ndimage.label(mask)
+    if n_components == 0:
+        return None
+
+    sizes = ndimage.sum(mask, labeled, index=range(1, n_components + 1))
+    largest_label = int(np.argmax(sizes)) + 1
+    largest_size = sizes[largest_label - 1]
+
+    if largest_size < min_area:
+        return None
+
+    rows, cols = np.where(labeled == largest_label)
+    x, y = int(cols.min()), int(rows.min())
+    w, h = int(cols.max() - x), int(rows.max() - y)
+    if w < 6 or h < 6 or (w / max(h, 1)) > 6 or (h / max(w, 1)) > 6:
+        return None
+
+    bbox_area = (w + 1) * (h + 1)
+    extent = largest_size / bbox_area
+    if extent < min_extent:
+        return None
+
+    return {"x": x, "y": y, "width": w, "height": h,
+            "center_x": x + w // 2, "center_y": y + h // 2}
 
-# ==========================================
-#   THIS SCRIPT DOES ALL THE THINKING.
-#   The ESP32 is a dumb actuator: it reports raw sensor telemetry
-#   ("T,<left>,<center>,<right>,<heading>") and executes drive
-#   commands ("M,<servo_angle>,<motor_speed>" / "S" to stop).
-#   Every decision -- when to reverse-arc, when to dodge a
-#   pillar, when to stop -- happens here.
-#
-#   REVERSE-ARC NOTE: when a LiDAR spike (SPIKE_THRESHOLD) fires, the
-#   L/R LiDARs are, by definition, in a moment where they can't be
-#   trusted for fine steering. So the realignment maneuver steers on
-#   BNO heading error only. The robot reverses while easing the servo
-#   from full lock toward center as heading closes in on the new
-#   cardinal target -- a diagonal arc that straightens out, landing the
-#   robot centered and squared up in the new corridor, no separate
-#   pivot-in-place step needed. LiDARs are still read and used purely
-#   as a coarse "something is way too close, pause" safety floor.
-# ==========================================
-
-# ==========================================
-#      ESP32 SERIAL CONNECTION
-# ==========================================
-ESP32_PORT = "/dev/ttyUSB0"
-ESP32_BAUD = 115200
-
-esp32 = None
-try:
-    esp32 = serial.Serial(ESP32_PORT, ESP32_BAUD, timeout=0.02)
-    time.sleep(2)  # let the ESP32 finish its reset-on-serial-open cycle
-    print(f"Connected to ESP32 on {ESP32_PORT}")
-except serial.SerialException as e:
-    print(f"Could not open {ESP32_PORT}: {e}")
-    print("Continuing in vision-only mode (no commands will be sent).")
-
-# ==========================================
-#      STEERING / DRIVE CONFIG
-#      (must stay inside the ESP32's SERVO_MIN/SERVO_MAX clamp)
-# ==========================================
-SERVO_CENTER = 87
-DIFF = 25
-SERVO_MAX_LEFT = SERVO_CENTER + DIFF
-SERVO_MAX_RIGHT = SERVO_CENTER - DIFF
-INVERT_STEERING = False  # flip if corrections steer the wrong way on your build
-
-STRAIGHT_SPEED = 150
-TURN_SPEED = 150
-DODGE_SPEED = 150
-
-# ==========================================
-#      STRAIGHT-LINE HEADING-HOLD PID
-# ==========================================
-STEERING_KP = 1.2
-STEERING_KI = 0.02
-STEERING_KD = 0.15
-HEADING_DEADBAND = 1.5        # degrees -- ignore jitter smaller than this
-MAX_STEER_CORRECTION = 20     # clamp -- no single correction can swing the servo too hard
-MAX_INTEGRAL = 50.0           # anti-windup clamp, degrees*seconds
-
-# ==========================================
-#      OBSTACLE TRIGGER CONFIG
-# ==========================================
-SPIKE_THRESHOLD = 100          # cm difference between L/R LiDAR that triggers a reverse-arc
-CARDINAL_HEADINGS = [0.0, 90.0, 180.0, 270.0]
-
-# ==========================================
-#      REVERSE-ARC CONFIG
-#      (replaces pivot-in-place turning -- steers on BNO heading only,
-#       since a LiDAR spike is exactly the moment those readings can't
-#       be trusted for fine correction)
-# ==========================================
-REVERSE_SPEED = -120            # constant reverse motor speed while arcing
-SLOW_STEER_THRESHOLD = 50.0     # degrees remaining where steering eases back toward center
-TURN_DONE_THRESHOLD = 6.0       # degrees remaining considered "arc complete"
-REVERSE_TIMEOUT_S = 2.5         # hard safety cap -- no rear sensor exists, never trust heading alone forever
-TURN_COOLDOWN_S = 1.0           # ignore obstacle checks for this long right after an arc completes
-MIN_TURN_CLEARANCE = 25         # cm -- coarse emergency-pause floor only, NOT a steering input
-MAX_TURNS = 12
-
-# ==========================================
-#      HEADING SMOOTHING
-#      (complementary filter, wrap-safe around 0/360)
-# ==========================================
-HEADING_SMOOTH_ALPHA = 0.2
-
-# ==========================================
-#      STOP CONDITION
-#      (L & R both close, front close, held continuously before acting)
-# ==========================================
-STOP_LEFT_RIGHT_DIST = 100
-STOP_CENTER_DIST = 150
-STOP_CONFIRM_S = 1.0
-
-# ==========================================
-#      VISION / DODGE CONFIG
-# ==========================================
-RESUME_AFTER_MISSES = 5   # consecutive empty frames before resuming normal driving
-DODGE_CONFIDENCE_MIN = 60
-
-
-# ==========================================
-#      SERIAL HELPERS
-# ==========================================
-def send_move_command(servo_angle, motor_speed):
-    if esp32 is None:
-        return
-    try:
-        esp32.write(f"M,{int(servo_angle)},{int(motor_speed)}\n".encode())
-    except serial.SerialException as e:
-        print(f"Serial write failed: {e}")
-
-
-def send_stop_command():
-    if esp32 is None:
-        return
-    try:
-        esp32.write(b"S\n")
-    except serial.SerialException as e:
-        print(f"Serial write failed: {e}")
-
-
-def drain_telemetry(brain):
-    """Read every buffered telemetry line from the ESP32, keeping only the latest."""
-    if esp32 is None:
-        return
-    while esp32.in_waiting:
-        try:
-            raw = esp32.readline().decode(errors="ignore").strip()
-        except serial.SerialException:
-            break
-        if raw:
-            brain.ingest_telemetry_line(raw)
-
-
-# ==========================================
-#      VISION: PILLAR DETECTION
-# ==========================================
-def white_balance_gray_world(img):
-    result = img.astype(np.float32)
-    avg_b = np.mean(result[:, :, 0])
-    avg_g = np.mean(result[:, :, 1])
-    avg_r = np.mean(result[:, :, 2])
-    avg_gray = (avg_b + avg_g + avg_r) / 3.0
-    result[:, :, 0] *= (avg_gray / max(avg_b, 1e-6))
-    result[:, :, 1] *= (avg_gray / max(avg_g, 1e-6))
-    result[:, :, 2] *= (avg_gray / max(avg_r, 1e-6))
-    return np.clip(result, 0, 255).astype(np.uint8)
-
-
-def is_pillar_shaped(contour, min_aspect_ratio=1.2, min_solidity=0.85):
-    """Rejects noisy blobs that pass the color mask but aren't pillar-shaped."""
-    x, y, w, h = cv2.boundingRect(contour)
-    if w == 0:
-        return False
-    aspect_ratio = h / float(w)
-    contour_area = cv2.contourArea(contour)
-    hull = cv2.convexHull(contour)
-    hull_area = cv2.contourArea(hull)
-    solidity = contour_area / float(hull_area) if hull_area > 0 else 0
-    return aspect_ratio >= min_aspect_ratio and solidity >= min_solidity
-
-
-def compute_confidence(contour, hsv_frame, low_arr, high_arr, ideal_aspect_ratio=2.0):
-    """
-    Composite 0-100% confidence score combining:
-    - Solidity (40%): how solid/convex the blob is vs. ragged noise
-    - Aspect ratio fit (30%): how close to an ideal elongated pillar shape
-    - Color centrality (30%): how deep into the S/V threshold range the
-      object's pixels sit, vs. just barely scraping past the edge
-    """
-    x, y, w, h = cv2.boundingRect(contour)
-    aspect_ratio = h / float(w) if w > 0 else 0
-    aspect_score = np.clip((aspect_ratio - 1.0) / (ideal_aspect_ratio - 1.0), 0, 1)
-
-    contour_area = cv2.contourArea(contour)
-    hull = cv2.convexHull(contour)
-    hull_area = cv2.contourArea(hull)
-    solidity = contour_area / float(hull_area) if hull_area > 0 else 0
-
-    obj_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
-    cv2.drawContours(obj_mask, [contour], -1, 255, -1)
-    mean_h, mean_s, mean_v = cv2.mean(hsv_frame, mask=obj_mask)[:3]
-
-    s_center = (int(low_arr[1]) + int(high_arr[1])) / 2.0
-    v_center = (int(low_arr[2]) + int(high_arr[2])) / 2.0
-    s_half_range = (int(high_arr[1]) - int(low_arr[1])) / 2.0 + 1e-6
-    v_half_range = (int(high_arr[2]) - int(low_arr[2])) / 2.0 + 1e-6
-    s_score = 1 - min(abs(mean_s - s_center) / s_half_range, 1.0)
-    v_score = 1 - min(abs(mean_v - v_center) / v_half_range, 1.0)
-    color_score = (s_score + v_score) / 2.0
-
-    confidence = (0.4 * solidity + 0.3 * aspect_score + 0.3 * color_score) * 100
-    return int(round(confidence))
-
-
-def compute_dodge_servo_angle(color, box_x, box_w, box_h, frame_w, frame_h):
-    """
-    - RED: keep to the RIGHT side of the lane -> steer right, pillar passes on the left.
-    - GREEN: keep to the LEFT side of the lane -> steer left, pillar passes on the right.
-    Offset scales with how close the object looks (taller box = closer).
-    """
-    closeness = min(box_h / (frame_h * 0.6), 1.0)  # tune the 0.6 divisor to your camera/track distance
-    max_offset = SERVO_MAX_LEFT - SERVO_CENTER  # assumes symmetric limits
-    offset = int(max_offset * closeness)
-
-    if color == "red":
-        servo_angle = SERVO_CENTER - offset
-    else:  # green
-        servo_angle = SERVO_CENTER + offset
-
-    return max(SERVO_MAX_RIGHT, min(SERVO_MAX_LEFT, servo_angle))
-
-
-def detect_pillars(frame, clahe):
-    """Runs the full color-detection pipeline on one frame and returns the
-    best (confidence, color, x, y, w, h) detection, or None. Also draws
-    boxes/labels onto `frame` in place."""
-    balanced_frame = white_balance_gray_world(frame)
-    blurred_frame = cv2.GaussianBlur(balanced_frame, (5, 5), 0)
-    hsv_frame = cv2.cvtColor(blurred_frame, cv2.COLOR_BGR2HSV)
-
-    h_ch, s_ch, v_ch = cv2.split(hsv_frame)
-    v_ch = clahe.apply(v_ch)
-    hsv_frame = cv2.merge([h_ch, s_ch, v_ch])
-
-    low_red1 = np.array([0, 140, 100])
-    high_red1 = np.array([8, 255, 255])
-    low_red2 = np.array([172, 140, 100])
-    high_red2 = np.array([180, 255, 255])
-
-    # Calibrated on the white-balance + CLAHE corrected feed --
-    # don't reuse numbers found on the raw uncorrected feed.
-    low_green = np.array([57, 0, 0])
-    high_green = np.array([79, 255, 255])
-
-    mask_red = cv2.inRange(hsv_frame, low_red1, high_red1) + cv2.inRange(hsv_frame, low_red2, high_red2)
-    mask_green = cv2.inRange(hsv_frame, low_green, high_green)
-
-    kernel = np.ones((5, 5), np.uint8)
-    mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel)
-    mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, kernel)
-    mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, kernel)
-    mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_CLOSE, kernel)
-
-    contours_red, _ = cv2.findContours(mask_red, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    contours_green, _ = cv2.findContours(mask_green, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-
-    best_detection = None  # (confidence, color, x, y, w, h) -- highest confidence wins
-
-    for contour in contours_red:
-        if cv2.contourArea(contour) > 1500 and is_pillar_shaped(contour):
-            conf = compute_confidence(contour, hsv_frame, low_red1, high_red1)
-            if conf < DODGE_CONFIDENCE_MIN:
-                continue
-            x, y, w, h = cv2.boundingRect(contour)
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
-            cv2.putText(frame, f"RED PILLAR {conf}%", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            if best_detection is None or conf > best_detection[0]:
-                best_detection = (conf, "red", x, y, w, h)
-
-    for contour in contours_green:
-        if cv2.contourArea(contour) > 1500 and is_pillar_shaped(contour):
-            conf = compute_confidence(contour, hsv_frame, low_green, high_green)
-            if conf < DODGE_CONFIDENCE_MIN:
-                continue
-            hull = cv2.convexHull(contour)
-            x, y, w, h = cv2.boundingRect(hull)
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            cv2.putText(frame, f"GREEN PILLAR {conf}%", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            if best_detection is None or conf > best_detection[0]:
-                best_detection = (conf, "green", x, y, w, h)
-
-    return best_detection
-
-
-# ==========================================
-#      ROBOT BRAIN -- the full state machine
-# ==========================================
-class RobotBrain:
-    def __init__(self):
-        self.state = "DRIVING_STRAIGHT"  # DRIVING_STRAIGHT | REVERSE_ARC | DODGING | STOPPED
-
-        # Latest raw sensor telemetry from the ESP32
-        self.left_dist = -1
-        self.center_dist = -1
-        self.right_dist = -1
-        self.raw_heading = 0.0
-
-        # Smoothed heading (complementary filter, wrap-safe)
-        self.smoothed_heading = 0.0
-        self.heading_initialized = False
-
-        # Straight-line PID state
-        self.straight_target_heading = 0.0
-        self.last_heading_error = 0.0
-        self.integral_error = 0.0
-        self.last_heading_time = time.time()
-
-        # Reverse-arc state
-        self.turn_target_heading = 0.0
-        self.is_turning_left = False
-        self.has_turned_once = False    # becomes True permanently on the first arc
-        self.locked_direction_left = False
-        self.total_turns = 0
-        self.turn_cooldown_until = 0.0
-        self.reverse_start_time = 0.0
-
-        # Stop-condition confirmation
-        self.stop_condition_active = False
-        self.stop_condition_start = 0.0
-
-        # Dodge state
-        self.consecutive_misses = 0
-        self.last_camera_status = "NO DETECTION"
-
-        self.final_servo_angle = SERVO_CENTER
-        self.final_motor_speed = 0
-
-    # ---------------- Telemetry ingestion ----------------
-    def ingest_telemetry_line(self, line):
-        # Format: T,<left>,<center>,<right>,<heading>
-        parts = line.split(",")
-        if len(parts) != 5 or parts[0] != "T":
-            return
-        try:
-            self.left_dist = int(parts[1])
-            self.center_dist = int(parts[2])
-            self.right_dist = int(parts[3])
-            self.raw_heading = float(parts[4])
-        except ValueError:
-            return
-        self._update_smoothed_heading()
-
-    def _update_smoothed_heading(self):
-        if not self.heading_initialized:
-            self.smoothed_heading = self.raw_heading
-            self.heading_initialized = True
-            self.straight_target_heading = self.raw_heading
-            return
-        diff = self.raw_heading - self.smoothed_heading
-        if diff > 180.0:
-            diff -= 360.0
-        if diff < -180.0:
-            diff += 360.0
-        self.smoothed_heading = (self.smoothed_heading + HEADING_SMOOTH_ALPHA * diff) % 360.0
-
-    # ---------------- Cardinal snap ----------------
-    @staticmethod
-    def snap_to_cardinal(angle):
-        """Forces a target onto the nearest of 0/90/180/270 so sensor
-        drift can never leave the robot aiming at something like 253 degrees."""
-        angle = angle % 360.0
-        best = CARDINAL_HEADINGS[0]
-        best_diff = 999.0
-        for c in CARDINAL_HEADINGS:
-            diff = abs(angle - c)
-            diff = min(diff, 360.0 - diff)
-            if diff < best_diff:
-                best_diff = diff
-                best = c
-        return best
-
-    def compute_turn_target(self, current_heading, turning_left):
-        raw = (current_heading - 90.0) if turning_left else (current_heading + 90.0)
-        raw %= 360.0
-        return self.snap_to_cardinal(raw)
-
-    # ---------------- Obstacle -> reverse-arc trigger ----------------
-    def check_obstacles(self):
-        if time.time() < self.turn_cooldown_until:
-            return
-        if self.left_dist == -1 or self.right_dist == -1:
-            return
-
-        difference = self.left_dist - self.right_dist
-
-        # Once a direction is locked, only ever evaluate that one branch.
-        if self.has_turned_once:
-            if self.locked_direction_left and difference > SPIKE_THRESHOLD:
-                self._start_reverse_arc(turning_left=True)
-            elif (not self.locked_direction_left) and difference < -SPIKE_THRESHOLD:
-                self._start_reverse_arc(turning_left=False)
-            return
-
-        if difference > SPIKE_THRESHOLD:
-            self.has_turned_once = True
-            self.locked_direction_left = True
-            print("!!! LAYOUT INITIALIZED: PERMANENT LEFT TURN ONLY LOCK ACTIVATED !!!")
-            self._start_reverse_arc(turning_left=True)
-        elif difference < -SPIKE_THRESHOLD:
-            self.has_turned_once = True
-            self.locked_direction_left = False
-            print("!!! LAYOUT INITIALIZED: PERMANENT RIGHT TURN ONLY LOCK ACTIVATED !!!")
-            self._start_reverse_arc(turning_left=False)
-
-    def _start_reverse_arc(self, turning_left):
-        self.is_turning_left = turning_left
-        # Target computed off heading at the moment of trigger -- LiDARs are
-        # spiking right now, so heading is the only trustworthy reference.
-        self.turn_target_heading = self.compute_turn_target(self.smoothed_heading, turning_left)
-        self.reverse_start_time = time.time()
-        self.state = "REVERSE_ARC"
-
-    # ---------------- Straight-line PID ----------------
-    def drive_straight_command(self):
-        now = time.time()
-        raw_error = self.straight_target_heading - self.smoothed_heading
-        if raw_error > 180.0:
-            raw_error -= 360.0
-        if raw_error < -180.0:
-            raw_error += 360.0
-
-        dt = max(now - self.last_heading_time, 0.001)
-        error_rate = (raw_error - self.last_heading_error) / dt
-
-        p_term_input = 0.0 if abs(raw_error) < HEADING_DEADBAND else raw_error
-
-        # Only accumulate the integral on a real (non-deadbanded) error, so it
-        # doesn't slowly drift from sensor noise while the robot is on target.
-        if abs(raw_error) >= HEADING_DEADBAND:
-            self.integral_error += raw_error * dt
-            self.integral_error = max(-MAX_INTEGRAL, min(MAX_INTEGRAL, self.integral_error))
-
-        correction = (p_term_input * STEERING_KP +
-                      self.integral_error * STEERING_KI +
-                      error_rate * STEERING_KD)
-        correction = int(round(max(-MAX_STEER_CORRECTION, min(MAX_STEER_CORRECTION, correction))))
-
-        self.last_heading_error = raw_error
-        self.last_heading_time = now
-
-        if INVERT_STEERING:
-            angle = SERVO_CENTER + correction
-        else:
-            angle = SERVO_CENTER - correction
-        angle = max(SERVO_MAX_RIGHT, min(SERVO_MAX_LEFT, angle))
-
-        return angle, STRAIGHT_SPEED
-
-    # ---------------- Reverse-arc ----------------
-    def reverse_arc_command(self):
-        """Reverses while steering purely on BNO heading error toward the
-        target cardinal heading. Full servo lock while heading error is
-        large, easing back toward center as it closes in -- producing a
-        diagonal-then-straight arc that lands centered and squared up,
-        with no separate pivot-in-place step. LiDARs are NOT used for
-        steering here (they're the thing that's spiking); they're only
-        checked as a coarse emergency-pause floor below."""
-        angle_difference = self.smoothed_heading - self.turn_target_heading
-        if angle_difference > 180.0:
-            angle_difference -= 360.0
-        if angle_difference < -180.0:
-            angle_difference += 360.0
-        remaining = abs(angle_difference)
-
-        left_extreme = SERVO_MAX_RIGHT if INVERT_STEERING else SERVO_MAX_LEFT
-        right_extreme = SERVO_MAX_LEFT if INVERT_STEERING else SERVO_MAX_RIGHT
-
-        if remaining < SLOW_STEER_THRESHOLD:
-            progress = remaining / SLOW_STEER_THRESHOLD
-            if self.is_turning_left:
-                max_offset = left_extreme - SERVO_CENTER
-                angle = SERVO_CENTER + int(round(max_offset * progress))
-            else:
-                max_offset = SERVO_CENTER - right_extreme
-                angle = SERVO_CENTER - int(round(max_offset * progress))
-        else:
-            angle = left_extreme if self.is_turning_left else right_extreme
-
-        speed = REVERSE_SPEED
-
-        # Coarse emergency floor only -- spiking LiDARs can't be trusted for
-        # fine correction, but a sudden very-small reading is still worth
-        # pausing the reverse for a frame rather than trusting heading blindly.
-        closest = min(
-            d for d in (self.left_dist, self.right_dist) if d > 0
-        ) if (self.left_dist > 0 or self.right_dist > 0) else 9999
-        if closest < MIN_TURN_CLEARANCE:
-            speed = 0
-
-        timed_out = (time.time() - self.reverse_start_time) > REVERSE_TIMEOUT_S
-
-        if remaining < TURN_DONE_THRESHOLD or timed_out:
-            self.total_turns += 1
-            self.straight_target_heading = self.turn_target_heading
-            self.state = "DRIVING_STRAIGHT"
-            self.turn_cooldown_until = time.time() + TURN_COOLDOWN_S
-            self.integral_error = 0.0
-            angle = SERVO_CENTER
-            speed = 0
-
-        return angle, speed
-
-    # ---------------- Stop condition ----------------
-    def check_stop_condition(self):
-        condition_met = (
-            0 < self.left_dist < STOP_LEFT_RIGHT_DIST and
-            0 < self.right_dist < STOP_LEFT_RIGHT_DIST and
-            0 < self.center_dist < STOP_CENTER_DIST and
-            self.total_turns >= MAX_TURNS
-        )
-        if condition_met:
-            if not self.stop_condition_active:
-                self.stop_condition_active = True
-                self.stop_condition_start = time.time()
-            elif time.time() - self.stop_condition_start >= STOP_CONFIRM_S:
-                self.state = "STOPPED"
-        else:
-            self.stop_condition_active = False
-
-    # ---------------- Top-level decision per frame ----------------
-    def step(self, best_detection, frame_w, frame_h):
-        """Runs one control cycle and returns (servo_angle, motor_speed)."""
-        if self.state == "STOPPED":
-            self.final_servo_angle, self.final_motor_speed = SERVO_CENTER, 0
-            return self.final_servo_angle, self.final_motor_speed
-
-        self.check_stop_condition()
-        if self.state == "STOPPED":
-            self.final_servo_angle, self.final_motor_speed = SERVO_CENTER, 0
-            return self.final_servo_angle, self.final_motor_speed
-
-        # Vision may only take over while driving straight (or while already
-        # dodging) -- never interrupt an active reverse-arc to dodge.
-        if best_detection is not None and self.state in ("DRIVING_STRAIGHT", "DODGING"):
-            conf, color, x, y, w, h = best_detection
-            angle = compute_dodge_servo_angle(color, x, w, h, frame_w, frame_h)
-            self.state = "DODGING"
-            self.consecutive_misses = 0
-            self.last_camera_status = f"{color.upper()} DETECTED ({conf}%)"
-            self.final_servo_angle, self.final_motor_speed = angle, DODGE_SPEED
-            return self.final_servo_angle, self.final_motor_speed
-
-        if self.state == "DODGING":
-            self.consecutive_misses += 1
-            if self.consecutive_misses >= RESUME_AFTER_MISSES:
-                self.state = "DRIVING_STRAIGHT"
-                self.last_camera_status = "NO DETECTION"
-                # Re-anchor heading so the robot doesn't try to correct back
-                # to whatever direction it was facing before the dodge.
-                self.straight_target_heading = self.smoothed_heading
-            else:
-                self.final_servo_angle, self.final_motor_speed = SERVO_CENTER, DODGE_SPEED
-                return self.final_servo_angle, self.final_motor_speed
-
-        if self.state == "DRIVING_STRAIGHT":
-            self.check_obstacles()
-            if self.state == "REVERSE_ARC":
-                angle, speed = self.reverse_arc_command()
-            else:
-                angle, speed = self.drive_straight_command()
-        elif self.state == "REVERSE_ARC":
-            angle, speed = self.reverse_arc_command()
-        else:
-            angle, speed = SERVO_CENTER, 0
-
-        self.final_servo_angle, self.final_motor_speed = angle, speed
-        return angle, speed
-
-    # ---------------- Debug ----------------
-    def telemetry_line(self):
-        """Human-readable status line, printed from the Pi since it's the
-        only side that knows the full state."""
-        lock = "NONE"
-        if self.has_turned_once:
-            lock = "LEFT_ONLY" if self.locked_direction_left else "RIGHT_ONLY"
-
-        parts = [
-            f"MODE: {self.state:16s}",
-            f"| L: {self.left_dist}cm",
-            f"| C: {self.center_dist}cm",
-            f"| R: {self.right_dist}cm",
-            f"| Turns: {self.total_turns}",
-            f"| CAM: {self.last_camera_status}",
-            f"| LOCK: {lock}",
-        ]
-
-        if self.state == "DRIVING_STRAIGHT":
-            raw_error = self.straight_target_heading - self.smoothed_heading
-            if raw_error > 180.0:
-                raw_error -= 360.0
-            if raw_error < -180.0:
-                raw_error += 360.0
-            parts.append(f"| Target: {self.straight_target_heading:.1f}\u00b0")
-            parts.append(f"| Current: {self.smoothed_heading:.1f}\u00b0")
-            parts.append(f"| Error: {raw_error:.1f}\u00b0")
-        elif self.state == "REVERSE_ARC":
-            angle_difference = self.smoothed_heading - self.turn_target_heading
-            if angle_difference > 180.0:
-                angle_difference -= 360.0
-            if angle_difference < -180.0:
-                angle_difference += 360.0
-            parts.append(f"| Target: {self.turn_target_heading:.1f}\u00b0")
-            parts.append(f"| Current: {self.smoothed_heading:.1f}\u00b0")
-            parts.append(f"| Delta: {abs(angle_difference):.1f}\u00b0")
-        elif self.state == "DODGING":
-            parts.append(f"| Current: {self.smoothed_heading:.1f}\u00b0")
-
-        parts.append(f"| Servo Angle: {self.final_servo_angle}\u00b0")
-        parts.append(f"| Motor: {self.final_motor_speed}")
-
-        return " ".join(parts)
-
-
-# ==========================================
-#             MAIN LOOP
-# ==========================================
-def main():
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("Error: Could not open webcam.")
-        return
-
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    brain = RobotBrain()
-
-    print("Press 'q' to close the camera window.")
-    frame_count = 0
+
+def process_frame(frame: np.ndarray, calib: dict, edge_margin: int = 6) -> tuple:
+    """Process a frame and detect red/green blocks."""
+    if frame is None or frame.size == 0:
+        return None, None
+
+    lab = rgb_to_lab(frame)
+    red_mask, green_mask = get_masks(lab, calib)
+
+    if edge_margin > 0:
+        red_mask[:edge_margin, :] = False
+        red_mask[-edge_margin:, :] = False
+        red_mask[:, :edge_margin] = False
+        red_mask[:, -edge_margin:] = False
+        green_mask[:edge_margin, :] = False
+        green_mask[-edge_margin:, :] = False
+        green_mask[:, :edge_margin] = False
+        green_mask[:, -edge_margin:] = False
+
+    red_box = extract_bounding_box(red_mask)
+    green_box = extract_bounding_box(green_mask)
+    return red_box, green_box
+
+
+def upscale_for_display(frame_bgr: np.ndarray, scale: int = 3) -> np.ndarray:
+    """Upscale for display."""
+    h, w = frame_bgr.shape[:2]
+    return cv2.resize(frame_bgr, (w * scale, h * scale), interpolation=cv2.INTER_NEAREST)
+
+
+def draw_boxes(frame_bgr: np.ndarray, red_box: dict, green_box: dict, roi: tuple = None) -> np.ndarray:
+    out = frame_bgr.copy()
+
+    if roi is not None:
+        rx, ry, rw, rh = roi
+        cv2.rectangle(out, (rx, ry), (rx + rw, ry + rh), (255, 255, 0), 1)
+
+    if red_box:
+        x, y, w, h = red_box['x'], red_box['y'], red_box['width'], red_box['height']
+        cx, cy = red_box['center_x'], red_box['center_y']
+
+        cv2.rectangle(out, (x, y), (x + w, y + h), (0, 0, 255), 2)
+        cv2.circle(out, (cx, cy), 3, (0, 0, 255), -1)
+
+        label1 = f"RED {w}x{h}px"
+        label2 = f"pos=({x},{y}) center=({cx},{cy})"
+        cv2.putText(out, label1, (x, max(0, y - 22)), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
+        cv2.putText(out, label2, (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 255), 1)
+
+    if green_box:
+        x, y, w, h = green_box['x'], green_box['y'], green_box['width'], green_box['height']
+        cx, cy = green_box['center_x'], green_box['center_y']
+
+        cv2.rectangle(out, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        cv2.circle(out, (cx, cy), 3, (0, 255, 0), -1)
+
+        label1 = f"GREEN {w}x{h}px"
+        label2 = f"pos=({x},{y}) center=({cx},{cy})"
+        cv2.putText(out, label1, (x, max(0, y - 22)), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1)
+        cv2.putText(out, label2, (x, max(0, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 0), 1)
+
+    return out
+
+
+def sample_roi_lab(frame: np.ndarray, roi: tuple) -> np.ndarray:
+    """Sample LAB values from ROI."""
+    x, y, w, h = roi
+    patch = frame[y:y + h, x:x + w]
+    return rgb_to_lab(patch)
+
+
+def calibrate_color(lab_patches: list, margin: float = 5.0,
+                     l_percentile: float = 5.0, max_tol: float = 15.0) -> dict:
+    """Derive thresholds from sampled patches."""
+    a_vals = np.concatenate([p[..., 1].flatten() for p in lab_patches])
+    b_vals = np.concatenate([p[..., 2].flatten() for p in lab_patches])
+    l_vals = np.concatenate([p[..., 0].flatten() for p in lab_patches])
+
+    a_center = float(np.median(a_vals))
+    b_center = float(np.median(b_vals))
+    a_mad = float(np.median(np.abs(a_vals - a_center)))
+    b_mad = float(np.median(np.abs(b_vals - b_center)))
+
+    spread = np.sqrt((a_mad * 1.4826) ** 2 + (b_mad * 1.4826) ** 2)
+    tol = min(spread * 1.3 + margin, max_tol)
+
+    return {
+        'a_center': a_center,
+        'b_center': b_center,
+        'tol': tol,
+        'l_min': float(np.percentile(l_vals, l_percentile)),
+    }
+
+
+def run_calibration_session(get_frame, roi: tuple, window_name: str) -> dict:
+    """Interactive calibration session."""
+    MAX_SAMPLES = 6
+    samples = {'red': deque(maxlen=MAX_SAMPLES), 'green': deque(maxlen=MAX_SAMPLES)}
+    calib = {}
+
+    print("\n=== CALIBRATION SESSION ===")
+    print("Tip: let the camera's auto-exposure settle for a second before sampling.")
+    print("Hold the RED block inside the cyan box, press 1 to sample (3-4x, moving it slightly).")
+    print("Hold the GREEN block inside the cyan box, press 2 to sample (3-4x).")
+    print("Press N when satisfied with both, or R to clear the last color's samples.")
+    print("Press Q to abort calibration.\n")
+
+    last_color = None
+    last_sample_time = 0.0
+    debounce_s = 0.6
 
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("Failed to grab frame.")
-            break
+        frame = get_frame()
+        if frame is None:
+            continue
 
-        drain_telemetry(brain)
+        red_box, green_box = (None, None)
+        if calib:
+            red_box, green_box = process_frame(frame, calib)
 
-        best_detection = detect_pillars(frame, clahe)
-        frame_h, frame_w = frame.shape[:2]
+        bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        display = draw_boxes(bgr, red_box, green_box, roi=roi)
+        display = upscale_for_display(display, scale=3)
+        status = (f"RED samples:{len(samples['red'])} GREEN samples:{len(samples['green'])} | "
+                  f"1=sample RED  2=sample GREEN  N=done  Q=abort")
+        cv2.putText(display, status, (5, display.shape[0] - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        cv2.imshow(window_name, display)
 
-        servo_angle, motor_speed = brain.step(best_detection, frame_w, frame_h)
-        send_move_command(servo_angle, motor_speed)
+        key = cv2.waitKey(50) & 0xFF
+        now = time.monotonic()
 
-        cv2.putText(frame, f"{brain.state} | servo={servo_angle} speed={motor_speed}",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.imshow("Live Object Detection", frame)
+        if key == ord('1') and (now - last_sample_time) > debounce_s:
+            samples['red'].append(sample_roi_lab(frame, roi))
+            calib['red'] = calibrate_color(list(samples['red']))
+            last_color = 'red'
+            last_sample_time = now
+            print(f"Sampled RED ({len(samples['red'])}/{MAX_SAMPLES}) -> "
+                  f"a_center={calib['red']['a_center']:.1f} b_center={calib['red']['b_center']:.1f} "
+                  f"tol={calib['red']['tol']:.1f} l_min={calib['red']['l_min']:.1f}")
+        elif key == ord('2') and (now - last_sample_time) > debounce_s:
+            samples['green'].append(sample_roi_lab(frame, roi))
+            calib['green'] = calibrate_color(list(samples['green']))
+            last_color = 'green'
+            last_sample_time = now
+            print(f"Sampled GREEN ({len(samples['green'])}/{MAX_SAMPLES}) -> "
+                  f"a_center={calib['green']['a_center']:.1f} b_center={calib['green']['b_center']:.1f} "
+                  f"tol={calib['green']['tol']:.1f} l_min={calib['green']['l_min']:.1f}")
+        elif key == ord('r') and last_color:
+            samples[last_color].clear()
+            calib.pop(last_color, None)
+            print(f"Cleared samples for {last_color} — start sampling it again.")
+        elif key == ord('n'):
+            if 'red' in calib and 'green' in calib:
+                print("Calibration accepted.\n")
+                return calib
+            print("Sample both RED (1) and GREEN (2) before continuing.")
+        elif key == ord('q'):
+            print("Calibration aborted, using previous/default calibration if any.")
+            return calib
 
-        frame_count += 1
-        print(brain.telemetry_line())
+    return calib
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
 
-    send_stop_command()
-    cap.release()
-    cv2.destroyAllWindows()
-    if esp32 is not None:
-        esp32.close()
+def open_camera(camera_id: int):
+    """Open camera using PyAV with improved settings."""
+    try:
+        container = av.open(
+            f'/dev/video{camera_id}',
+            format='v4l2',
+            options={
+                'video_size': '640x480',
+                'framerate': '30',
+                'input_format': 'mjpeg'
+            }
+        )
+        stream = container.streams.video[0]
+        stream.thread_type = 'AUTO'
+        return container, stream
+    except Exception as e:
+        try:
+            container = av.open(
+                f'/dev/video{camera_id}',
+                format='v4l2',
+                options={
+                    'video_size': '640x480',
+                    'framerate': '30',
+                    'input_format': 'yuyv422'
+                }
+            )
+            stream = container.streams.video[0]
+            stream.thread_type = 'AUTO'
+            return container, stream
+        except Exception as e:
+            print(f"Camera error: {e}")
+            return None, None
 
+
+def resize_frame(frame: np.ndarray, target_w: int = 240, target_h: int = 240) -> np.ndarray:
+    """Resize frame using OpenCV (faster and more reliable than PIL)."""
+    if frame is None or frame.size == 0:
+        return None
+    return cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+
+def start_capture_thread(container, stream, frame_size=240):
+    """Start capture thread with improved frame handling."""
+    frame_q = queue.Queue(maxsize=1)
+    stop_flag = threading.Event()
+
+    def capture_loop():
+        try:
+            for packet in container.demux(stream):
+                if stop_flag.is_set():
+                    break
+                for frame in packet.decode():
+                    if stop_flag.is_set():
+                        break
+                    try:
+                        if frame.format.name != 'rgb24':
+                            frame = frame.reformat(format='rgb24')
+                        img = frame.to_ndarray(format='rgb24')
+
+                        if img is not None and img.size > 0:
+                            img = resize_frame(img, frame_size, frame_size)
+                            # img = cv2.rotate(img, cv2.ROTATE_180)
+                            if img is not None:
+                                if frame_q.full():
+                                    try:
+                                        frame_q.get_nowait()
+                                    except queue.Empty:
+                                        pass
+                                frame_q.put(img)
+                    except Exception as e:
+                        print(f"Frame processing error: {e}")
+                        continue
+        except Exception as e:
+            print(f"\nCapture thread stopped: {e}")
+
+    t = threading.Thread(target=capture_loop, daemon=True)
+    t.start()
+    return t, frame_q, stop_flag
+
+
+def set_manual_camera_controls(camera_id: int, exposure_value: int = 156,
+                                wb_temperature: int = 4500):
+    """Lock auto_exposure/white_balance so LAB calibration stays stable across runs."""
+    dev = f'/dev/video{camera_id}'
+    cmds = [
+        ['v4l2-ctl', '-d', dev, '-c', 'auto_exposure=1'],
+        ['v4l2-ctl', '-d', dev, '-c', f'exposure_time_absolute={exposure_value}'],
+        ['v4l2-ctl', '-d', dev, '-c', 'white_balance_automatic=0'],
+        ['v4l2-ctl', '-d', dev, '-c', f'white_balance_temperature={wb_temperature}'],
+    ]
+    for cmd in cmds:
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"Warning: could not run {' '.join(cmd)} ({e})")
+    print(f"Camera controls locked: exposure={exposure_value}, wb_temp={wb_temperature}")
+
+
+def create_kalman_filter():
+    """Constant-velocity Kalman filter: state=[x,y,vx,vy], measurement=[x,y]."""
+    kf = cv2.KalmanFilter(4, 2, 0, type = cv2.CV_64F)
+    kf.measurementMatrix = np.array([[1, 0, 0, 0],
+                                       [0, 1, 0, 0]], np.float64)
+    kf.transitionMatrix = np.array([[1, 0, 1, 0],
+                                      [0, 1, 0, 1],
+                                      [0, 0, 1, 0],
+                                      [0, 0, 0, 1]], np.float64)
+    kf.processNoiseCov = np.eye(4, dtype=np.float64) * 0.03
+    kf.measurementNoiseCov = np.eye(2, dtype=np.float64) * 1.0
+    return kf
+
+
+
+
+
+def kalman_update(kf, box, initialized: bool):
+    if box is not None:
+        measurement = np.array([[np.float64(box['center_x'])],
+                                [np.float64(box['center_y'])]])
+        if not initialized:
+            kf.statePre = np.array([[box['center_x']], [box['center_y']], [0], [0]], np.float64)
+            kf.statePost = np.array([[box['center_x']], [box['center_y']], [0], [0]], np.float64)
+            initialized = True
+        else:
+            kf.predict()
+
+        kf.correct(measurement)
+
+        smoothed = {
+            'center_x': int(kf.statePost[0, 0]),
+            'center_y': int(kf.statePost[1, 0]),
+            'vx': float(kf.statePost[2, 0]),
+            'vy': float(kf.statePost[3, 0])
+        }
+        return smoothed, initialized
+    else:
+
+        if not initialized:
+            return None, initialized
+        predicted = kf.predict()
+        smoothed = {
+            'center_x': int(predicted[0, 0]),
+            'center_y': int(predicted[1, 0]),
+            'vx': float(predicted[2, 0]),
+            'vy': float(predicted[3, 0])
+        }
+        return smoothed, initialized
+
+def main(camera_id: int = 0, frame_size: int = 240):
+    """Main function with improved camera handling."""
+
+    # --- Lock exposure/white balance before opening the stream ---
+    set_manual_camera_controls(camera_id, exposure_value=500, wb_temperature=4500)
+
+    # --- Serial connection to ESP32 ---
+    try:
+        ser = serial.Serial('/dev/ttyUSB0', 115200, timeout=1)
+        print("Serial port opened")
+    except Exception as e:
+        print(f"Could not open serial port: {e}")
+        ser = None
+
+    # --- Open camera ---
+    container, stream = open_camera(camera_id)
+    if container is None:
+        print("Cannot open webcam.")
+        return
+
+    # --- Start capture thread ---
+    t, frame_q, stop_flag = start_capture_thread(container, stream, frame_size)
+
+    def get_frame(timeout=1.0):
+        try:
+            return frame_q.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    # --- Test frame capture ---
+    print("Testing camera...")
+    test_frames = 0
+    for _ in range(10):
+        frame = get_frame(timeout=2.0)
+        if frame is not None:
+            test_frames += 1
+            print(f"Got test frame {test_frames}, shape: {frame.shape}")
+        time.sleep(0.1)
+
+    if test_frames == 0:
+        print("No frames received from camera!")
+        stop_flag.set()
+        t.join(timeout=2.0)
+        container.close()
+        return
+
+    # --- Main loop ---
+    window_name = "WRO Block Detector"
+    cv2.namedWindow(window_name)
+
+    roi_w, roi_h = frame_size // 5, frame_size // 5
+    roi = ((frame_size - roi_w) // 2, (frame_size - roi_h) // 2, roi_w, roi_h)
+
+    calib = run_calibration_session(get_frame, roi, window_name)
+
+    print("=== LIVE DETECTION ===")
+    print("Press C to recalibrate, Q to quit.\n")
+
+    history_len = 5
+    required = 3
+    red_hist = deque(maxlen=history_len)
+    green_hist = deque(maxlen=history_len)
+
+    # --- Single Kalman filter for whichever color is currently tracked ---
+    kf = create_kalman_filter()
+    kf_initialized = False
+    kf_color = None  # which color the filter is currently locked onto
+
+    last_sent = None
+    frame_count = 0
+    detection_line_y = int(frame_size * DETECTION_LINE_RATIO)
+
+    try:
+        while True:
+            frame = get_frame(timeout=0.5)
+            if frame is None:
+                continue
+
+            red_box, green_box = process_frame(frame, calib)
+            red_box = box_below_detection_line(red_box, detection_line_y)
+            green_box = box_below_detection_line(green_box, detection_line_y)
+            red_hist.append(red_box)
+            green_hist.append(green_box)
+
+            red_confirmed = sum(b is not None for b in red_hist) >= required
+            green_confirmed = sum(b is not None for b in green_hist) >= required
+
+
+            current_detection = None
+            active_box = None
+
+            # Determine which block to act on, if any
+            if red_confirmed and green_confirmed:
+                if red_box is not None and green_box is not None:
+                # Both visible – pick the closer one (taller box)
+                    if red_box['height'] >= green_box['height']:
+                        primary_box = red_box
+                        primary_color = 'red'
+                    else:
+                        primary_box = green_box
+                        primary_color = 'green'
+                elif red_box is not None:
+                    primary_box = red_box
+                    primary_color = 'red'
+                elif green_box is not None:
+                    primary_box = green_box
+                    primary_color = 'green'
+                else:
+                    primary_box = None
+                    primary_color = None
+            elif red_confirmed:
+                primary_box = red_box
+                primary_color = 'red'
+            elif green_confirmed:
+                primary_box = green_box
+                primary_color = 'green'
+            else:
+                primary_box = None
+                primary_color = None
+
+            if primary_box is not None:
+                # Apply the side rule (correct passage direction)
+                if primary_color == 'red':
+                    if primary_box['center_x'] <= LEFT_SIDE_MAX:
+                        # Already on the left – safe, no swerve needed
+                        current_detection = None
+                    else:
+                        current_detection = 'red'
+                        active_box = primary_box
+                else:  # green
+                    if primary_box['center_x'] >= RIGHT_SIDE_MIN:
+                        # Already on the right – safe
+                        current_detection = None
+                    else:
+                        current_detection = 'green'
+                        active_box = primary_box
+
+            if current_detection is not None and active_box is not None:
+                if active_box['height'] > REVERSE_HEIGHT and ser is not None:
+                    ser.write(b'REVERSE\n')
+                    print(">>> Sent REVERSE (too close)")
+                    # skip the normal command for this frame
+                    current_detection = None   # so it doesn't send RED/GREEN
+
+            # --- Kalman smoothing for steering (single filter, reset on target change) ---
+            if current_detection != kf_color:
+                kf = create_kalman_filter()
+                kf_initialized = False
+                kf_color = current_detection
+
+            smoothed = None
+            if current_detection is not None:
+                smoothed, kf_initialized = kalman_update(kf, active_box, kf_initialized)
+
+            # Send command only on change
+            if current_detection != last_sent and ser is not None:
+                if current_detection == 'red':
+                    ser.write(b'RED\n')
+                    print(">>> Sent RED")
+                elif current_detection == 'green':
+                    ser.write(b'GREEN\n')
+                    print(">>> Sent GREEN")
+                else:
+                    ser.write(b'CLEAR\n')
+                    print(">>> Sent CLEAR")
+                last_sent = current_detection
+
+            # Send smoothed steering data every frame while tracking
+            if current_detection is not None and smoothed is not None and ser is not None:
+                steer_msg = (f"{current_detection.upper()},"
+                             f"{smoothed['center_x']},{smoothed['center_y']},"
+                             f"{smoothed['vx']:.1f}\n")
+                ser.write(steer_msg.encode())
+
+            # Display
+            display_red = red_box if red_confirmed else None
+            display_green = green_box if green_confirmed else None
+            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            display = draw_boxes(bgr, display_red, display_green)
+
+            cv2.line(display, (LEFT_SIDE_MAX, 0), (LEFT_SIDE_MAX, frame_size-1), (0, 165, 255), 1)
+            cv2.putText(display, "RED SAFE <", (2, 10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 165, 255), 1)
+            
+            cv2.line(display, (RIGHT_SIDE_MIN, 0), (RIGHT_SIDE_MIN, frame_size-1), (0,255,0), 1)
+            cv2.putText(display, "GREEN SAFE >", (RIGHT_SIDE_MIN+2, 10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 0), 1)
+
+            cv2.line(display, (0, detection_line_y), (frame_size - 1, detection_line_y), (255, 255, 0), 1)
+            cv2.putText(display, "DETECT BELOW", (2, detection_line_y - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 0), 1)
+
+            cv2.putText(display, "DANGER", (LEFT_SIDE_MAX+5, frame_size-10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
+            
+            Ldisplay = upscale_for_display(display, scale=3)
+            cv2.imshow(window_name, display)
+            frame_count += 1
+            red_str = (f"RED[x={display_red['x']}px, y={display_red['y']}px, "
+                        f"w={display_red['width']}px, h={display_red['height']}px, "
+                        f"center=({display_red['center_x']}px, {display_red['center_y']}px)]"
+                        if display_red else "RED:None")
+
+            green_str = (f"GREEN[x={display_green['x']}px, y={display_green['y']}px, "
+                        f"w={display_green['width']}px, h={display_green['height']}px, "
+                        f"center=({display_green['center_x']}px, {display_green['center_y']}px)]"
+                        if display_green else "GREEN:None")
+
+            smoothed_str = (f"SMOOTHED[{kf_color},x={smoothed['center_x']},y={smoothed['center_y']},"
+                             f"vx={smoothed['vx']:.1f},vy={smoothed['vy']:.1f}]"
+                             if smoothed is not None else "SMOOTHED:None")
+
+            print(f"Frame {frame_count} | {red_str} | {green_str} | {smoothed_str}", flush=True)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('c'):
+                calib = run_calibration_session(get_frame, roi, window_name)
+                red_hist.clear()
+                green_hist.clear()
+                last_sent = None
+                kf = create_kalman_filter()
+                kf_initialized = False
+                kf_color = None
+                print("=== LIVE DETECTION ===")
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_flag.set()
+        t.join(timeout=2.0)
+        container.close()
+        if ser is not None:
+            ser.close()
+        cv2.destroyAllWindows()
+        print("\nFinal calibration used:")
+        for color, c in calib.items():
+            print(f"  {color}: {c}")
 
 if __name__ == "__main__":
-    main()
+    main(camera_id=0, frame_size=240)
