@@ -20,6 +20,17 @@ REVERSE_HEIGHT = 80  # if block is below this y, reverse instead of swerve
             # --- Thresholds for determining which side the block is on ---
 LEFT_SIDE_MAX   = 90   # pixel x < this = left side
 RIGHT_SIDE_MIN  = 150   # pixel x > this = right side
+
+# --- NEW: minimum time to stay committed to an avoidance maneuver ---
+# Once we start swerving around a block, we keep steering away from it for at
+# least this many seconds, even if the block's bounding box slips into the
+# "safe" zone in the meantime (which happens right as we pass alongside it).
+# Without this, the CLEAR command fires the instant the box crosses the
+# safe-zone line, the servo snaps back to center immediately, and the robot
+# clips the block on the way past. Tune this to how long a swerve takes.
+AVOID_MIN_DURATION_S = 2.0
+
+
 def rgb_to_lab(frame: np.ndarray) -> np.ndarray:
     """Convert RGB to LAB color space."""
     rgb = frame.astype(np.float32) / 255.0
@@ -374,9 +385,6 @@ def create_kalman_filter():
     return kf
 
 
-
-
-
 def kalman_update(kf, box, initialized: bool):
     if box is not None:
         measurement = np.array([[np.float64(box['center_x'])],
@@ -483,6 +491,10 @@ def main(camera_id: int = 0, frame_size: int = 240):
     clear_counter = 0      
     CLEAR_HISTORY = 10
 
+    # --- NEW: tracks when the *current* avoidance maneuver began, so we can
+    # hold the swerve for at least AVOID_MIN_DURATION_S before allowing CLEAR ---
+    avoid_start_time = None
+
     try:
         while True:
             frame = get_frame(timeout=0.5)
@@ -566,6 +578,29 @@ def main(camera_id: int = 0, frame_size: int = 240):
                     # skip the normal command for this frame
                     current_detection = None   # so it doesn't send RED/GREEN
 
+            # --- NEW: enforce a minimum avoidance hold time ---
+            # If we're actively avoiding a block (last_sent is RED/GREEN) and the
+            # detector now says "safe" (current_detection is None), don't let go
+            # of the swerve until AVOID_MIN_DURATION_S has passed since we first
+            # started avoiding it. This stops the servo from snapping back to
+            # center — and clipping the block — the instant the box crosses into
+            # the safe zone mid-pass.
+            now_t = time.monotonic()
+
+            if current_detection in ('red', 'green'):
+                # (Re)start the timer whenever we begin avoiding, or switch which
+                # block we're avoiding.
+                if last_sent != current_detection or avoid_start_time is None:
+                    avoid_start_time = now_t
+            elif current_detection is None and last_sent in ('red', 'green'):
+                if avoid_start_time is not None and (now_t - avoid_start_time) < AVOID_MIN_DURATION_S:
+                    # Still inside the mandatory hold window — keep steering
+                    # away from the block even though it currently reads "safe".
+                    current_detection = last_sent
+                    active_box = None
+                else:
+                    avoid_start_time = None
+
             # --- Kalman smoothing for steering (single filter, reset on target change) ---
             if current_detection != kf_color:
                 kf = create_kalman_filter()
@@ -644,6 +679,7 @@ def main(camera_id: int = 0, frame_size: int = 240):
                 red_hist.clear()
                 green_hist.clear()
                 last_sent = None
+                avoid_start_time = None
                 kf = create_kalman_filter()
                 kf_initialized = False
                 kf_color = None
