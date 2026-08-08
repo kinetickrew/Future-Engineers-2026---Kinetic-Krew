@@ -46,7 +46,7 @@ const int RAMP_STEP = 30;
 const unsigned long RAMP_DURATION_MS = 2000;
 
 
-int SERVO_CENTER   = 70;   // Dead-center steering alignment
+int SERVO_CENTER   = 120;   // Dead-center steering alignment
 int DIFF = 25;
 int SERVO_MAX_LEFT = SERVO_CENTER + DIFF;  // Physical mechanical limit for left turn
 int SERVO_MAX_RIGHT= SERVO_CENTER - DIFF;   // Physical mechanical limit for right turn
@@ -150,6 +150,7 @@ unsigned long lastHeadingTime = 0;    // for time-based derivative
 // ---- Speed ramp-up state ----
 unsigned long driveStartTime = 0;   // when the very first straight-drive began
 bool rampActive = false;            // true while we're still ramping up from a stand-still
+bool rampArmedForThisPhase = false; // NEW: true once the ramp has been (re)started for the current phase
 
 // ==========================================
 //            I2C & SENSOR FUNCTIONS
@@ -265,24 +266,23 @@ void setMotorOutput(int speed) {
 // On the very first start (t=0), speed climbs in RAMP_STEP increments from
 // RAMP_START_SPEED up to STRAIGHT_SPEED over RAMP_DURATION_MS, so the car
 // doesn't dump full torque instantly and pop a wheelie off the line.
-int getRampedSpeed() {
-  if (!rampActive) return STRAIGHT_SPEED;
+int getRampedSpeed(int targetSpeed) {
+  if (!rampActive) return targetSpeed;
 
   unsigned long elapsed = millis() - driveStartTime;
 
   if (elapsed >= RAMP_DURATION_MS) {
-    rampActive = false;           // ramp finished — stop computing it every loop
-    return STRAIGHT_SPEED;
+    rampActive = false;
+    return targetSpeed;
   }
 
-  // How many 30-speed steps fit between RAMP_START_SPEED and STRAIGHT_SPEED
-  int numSteps = max(1, (STRAIGHT_SPEED - RAMP_START_SPEED) / RAMP_STEP);
+  int numSteps = max(1, (targetSpeed - RAMP_START_SPEED) / RAMP_STEP);
   unsigned long stepDuration = RAMP_DURATION_MS / numSteps;
 
   int stepIndex = elapsed / stepDuration;
   int speed = RAMP_START_SPEED + stepIndex * RAMP_STEP;
 
-  return constrain(speed, RAMP_START_SPEED, STRAIGHT_SPEED);
+  return constrain(speed, RAMP_START_SPEED, targetSpeed);
 }
 
 
@@ -334,6 +334,7 @@ void checkFrontObstacle() {
     turnPhaseStartTime = millis();
     currentState = TURNING;
     frontConditionActive = false;
+    rampArmedForThisPhase = false;   // ADD THIS LINE
   } else {
     frontConditionActive = false; // reset — condition dropped out before confirm delay completed
   }
@@ -341,7 +342,8 @@ void checkFrontObstacle() {
 
 
 void driveStraightMode(float currentHeading) {
-  setMotorOutput(getRampedSpeed());
+  if (!rampArmedForThisPhase) { driveStartTime = millis(); rampActive = true; rampArmedForThisPhase = true; }
+  setMotorOutput(getRampedSpeed(STRAIGHT_SPEED));
 
   float rawError = straightTargetHeading - currentHeading;
   if (rawError > 180.0)  rawError -= 360.0;
@@ -394,12 +396,15 @@ void executeTurnMode(float currentHeading) {
   int leftExtreme  = INVERT_STEERING ? SERVO_MAX_RIGHT : SERVO_MAX_LEFT;
   int rightExtreme = INVERT_STEERING ? SERVO_MAX_LEFT  : SERVO_MAX_RIGHT;
   int crankedAngle = isTurningLeft ? leftExtreme : rightExtreme;
+  // Opposite lock, used only while reversing — see PHASE_BACKWARD below.
+  int reverseCrankedAngle = isTurningLeft ? rightExtreme : leftExtreme;
 
   unsigned long now = millis();
   unsigned long phaseElapsed = now - turnPhaseStartTime;
 
   if (currentTurnPhase == PHASE_FORWARD) {
-    setMotorOutput(TURN_SPEED);
+    if (!rampArmedForThisPhase) { driveStartTime = millis(); rampActive = true; rampArmedForThisPhase = true; }
+    setMotorOutput(getRampedSpeed(TURN_SPEED));
     steeringServo.write(crankedAngle);
     finalServoAngle = crankedAngle;
 
@@ -408,29 +413,33 @@ void executeTurnMode(float currentHeading) {
     if (timeUp || tooClose) {
       currentTurnPhase = PHASE_BACKWARD;
       turnPhaseStartTime = now;
+      rampArmedForThisPhase = false;
     }
     return;
   }
 
   if (currentTurnPhase == PHASE_BACKWARD) {
-    // Reverse with the wheels still cranked the same way — this swings the
-    // rear of the car around, which is what actually rotates the heading.
-    setMotorOutput(BACKWARD_SPEED);
-    steeringServo.write(crankedAngle);
-    finalServoAngle = crankedAngle;
+    // Reverse with the wheels cranked OPPOSITE to the forward phase.
+    // While reversing, steering geometry flips: front wheels turned toward
+    // the turn direction swing the REAR the wrong way. Cranking the
+    // opposite direction here makes the rear swing toward the intended turn.
+    if (!rampArmedForThisPhase) { driveStartTime = millis(); rampActive = true; rampArmedForThisPhase = true; }
+    setMotorOutput(getRampedSpeed(BACKWARD_SPEED));
+    steeringServo.write(reverseCrankedAngle);
+    finalServoAngle = reverseCrankedAngle;
 
     if (phaseElapsed >= TURN_BACKWARD_MS) {
       currentTurnPhase = PHASE_FINAL;
       turnPhaseStartTime = now;
-      // Reset the D-term reference so PHASE_FINAL's proportional steering
-      // (below) doesn't see a stale angleDifference from before the reverse.
+      rampArmedForThisPhase = false;
       angleDifference = currentHeading - turnTargetHeading;
     }
     return;
   }
 
-  // PHASE_FINAL — original proportional turn-to-heading logic.
-  setMotorOutput(TURN_SPEED);
+  // PHASE_FINAL — unchanged, uses crankedAngle (forward-direction geometry) again.
+  if (!rampArmedForThisPhase) { driveStartTime = millis(); rampActive = true; rampArmedForThisPhase = true; }
+  setMotorOutput(getRampedSpeed(TURN_SPEED));
 
   angleDifference = currentHeading - turnTargetHeading;
   if (angleDifference > 180.0)  angleDifference -= 360.0;
@@ -458,9 +467,12 @@ void executeTurnMode(float currentHeading) {
     finalServoAngle = SERVO_CENTER;
     straightTargetHeading = turnTargetHeading;
     currentState = DRIVING_STRAIGHT;
-    currentTurnPhase = PHASE_FORWARD; // reset for next turn
+    currentTurnPhase = PHASE_FORWARD;
+    rampArmedForThisPhase = false;
     turnCooldownUntil = millis() + TURN_COOLDOWN_MS;
     integralError = 0.0;
+    lastHeadingError = 0.0;
+    lastHeadingTime = millis();
   }
 }
 
