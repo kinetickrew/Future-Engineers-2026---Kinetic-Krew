@@ -14,20 +14,12 @@ from PIL import Image
 # Danger zone – only react to blocks in the middle of the frame
 DANGER_LEFT  = 70
 DANGER_RIGHT = 170
+# --- Minimum height (in pixels) before the robot starts to swerve ---
+MIN_SWERVE_HEIGHT = 45   # block must be at least this tall to trigger avoidance
 REVERSE_HEIGHT = 80  # if block is below this y, reverse instead of swerve
-DETECTION_LINE_RATIO = 0.5  # blocks detected only when midpoint is below this y
             # --- Thresholds for determining which side the block is on ---
 LEFT_SIDE_MAX   = 90   # pixel x < this = left side
 RIGHT_SIDE_MIN  = 150   # pixel x > this = right side
-
-
-def box_below_detection_line(box: dict, line_y: int) -> dict:
-    """Return the box only if its midpoint is at or below the detection line."""
-    if box is None or box['center_y'] < line_y:
-        return None
-    return box
-
-
 def rgb_to_lab(frame: np.ndarray) -> np.ndarray:
     """Convert RGB to LAB color space."""
     rgb = frame.astype(np.float32) / 255.0
@@ -475,8 +467,8 @@ def main(camera_id: int = 0, frame_size: int = 240):
     print("=== LIVE DETECTION ===")
     print("Press C to recalibrate, Q to quit.\n")
 
-    history_len = 5
-    required = 3
+    history_len = 7
+    required = 5
     red_hist = deque(maxlen=history_len)
     green_hist = deque(maxlen=history_len)
 
@@ -487,7 +479,8 @@ def main(camera_id: int = 0, frame_size: int = 240):
 
     last_sent = None
     frame_count = 0
-    detection_line_y = int(frame_size * DETECTION_LINE_RATIO)
+    clear_counter = 0      
+    CLEAR_HISTORY = 10
 
     try:
         while True:
@@ -496,8 +489,6 @@ def main(camera_id: int = 0, frame_size: int = 240):
                 continue
 
             red_box, green_box = process_frame(frame, calib)
-            red_box = box_below_detection_line(red_box, detection_line_y)
-            green_box = box_below_detection_line(green_box, detection_line_y)
             red_hist.append(red_box)
             green_hist.append(green_box)
 
@@ -538,21 +529,34 @@ def main(camera_id: int = 0, frame_size: int = 240):
                 primary_color = None
 
             if primary_box is not None:
-                # Apply the side rule (correct passage direction)
-                if primary_color == 'red':
-                    if primary_box['center_x'] <= LEFT_SIDE_MAX:
-                        # Already on the left – safe, no swerve needed
-                        current_detection = None
-                    else:
-                        current_detection = 'red'
-                        active_box = primary_box
-                else:  # green
-                    if primary_box['center_x'] >= RIGHT_SIDE_MIN:
-                        # Already on the right – safe
-                        current_detection = None
-                    else:
-                        current_detection = 'green'
-                        active_box = primary_box
+                block_height = primary_box['height']
+                
+                # --- Too far away? (below 80) ---
+                if block_height < MIN_SWERVE_HEIGHT:   # REVERSE_HEIGHT = 80
+                    current_detection = None
+                    active_box = None
+                
+                # --- Dangerously close? (above 100) ---
+                elif block_height > REVERSE_HEIGHT:   # MIN_SWERVE_HEIGHT = 100
+                    if ser is not None:
+                        ser.write(b'REVERSE\n')
+                        print(">>> Sent REVERSE (too close)")
+                    current_detection = None   # skip normal command this frame
+                else:
+                    if primary_color == 'red':
+                        if primary_box['center_x'] <= LEFT_SIDE_MAX:
+                            # Already on the left – safe, no swerve needed
+                            current_detection = None
+                        else:
+                            current_detection = 'red'
+                            active_box = primary_box
+                    else:  # green
+                        if primary_box['center_x'] >= RIGHT_SIDE_MIN:
+                            # Already on the right – safe
+                            current_detection = None
+                        else:
+                            current_detection = 'green'
+                            active_box = primary_box
 
             if current_detection is not None and active_box is not None:
                 if active_box['height'] > REVERSE_HEIGHT and ser is not None:
@@ -570,26 +574,33 @@ def main(camera_id: int = 0, frame_size: int = 240):
             smoothed = None
             if current_detection is not None:
                 smoothed, kf_initialized = kalman_update(kf, active_box, kf_initialized)
+            if current_detection is None:
+                clear_counter += 1
+            else:
+                clear_counter = 0
 
             # Send command only on change
             if current_detection != last_sent and ser is not None:
-                if current_detection == 'red':
-                    ser.write(b'RED\n')
-                    print(">>> Sent RED")
-                elif current_detection == 'green':
-                    ser.write(b'GREEN\n')
-                    print(">>> Sent GREEN")
+                if current_detection is None and clear_counter < CLEAR_HISTORY:
+                    pass
                 else:
-                    ser.write(b'CLEAR\n')
-                    print(">>> Sent CLEAR")
-                last_sent = current_detection
+                    if current_detection == 'red':
+                        ser.write(b'RED\n')
+                        print(">>> Sent RED")
+                    elif current_detection == 'green':
+                        ser.write(b'GREEN\n')
+                        print(">>> Sent GREEN")
+                    else:
+                        ser.write(b'CLEAR\n')
+                        print(">>> Sent CLEAR")
+                    last_sent = current_detection
 
             # Send smoothed steering data every frame while tracking
-            if current_detection is not None and smoothed is not None and ser is not None:
-                steer_msg = (f"{current_detection.upper()},"
-                             f"{smoothed['center_x']},{smoothed['center_y']},"
-                             f"{smoothed['vx']:.1f}\n")
-                ser.write(steer_msg.encode())
+            # if current_detection is not None and smoothed is not None and ser is not None:
+            #     steer_msg = (f"{current_detection.upper()},"
+            #                  f"{smoothed['center_x']},{smoothed['center_y']},"
+            #                  f"{smoothed['vx']:.1f}\n")
+            #     ser.write(steer_msg.encode())
 
             # Display
             display_red = red_box if red_confirmed else None
@@ -602,9 +613,6 @@ def main(camera_id: int = 0, frame_size: int = 240):
             
             cv2.line(display, (RIGHT_SIDE_MIN, 0), (RIGHT_SIDE_MIN, frame_size-1), (0,255,0), 1)
             cv2.putText(display, "GREEN SAFE >", (RIGHT_SIDE_MIN+2, 10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 0), 1)
-
-            cv2.line(display, (0, detection_line_y), (frame_size - 1, detection_line_y), (255, 255, 0), 1)
-            cv2.putText(display, "DETECT BELOW", (2, detection_line_y - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 0), 1)
 
             cv2.putText(display, "DANGER", (LEFT_SIDE_MAX+5, frame_size-10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
             

@@ -161,7 +161,7 @@ bool headingInitialized = false;
 // --- Stop condition (L & R < 100cm, front < 150cm, held for 1 second) ---
 bool stopConditionActive             = false; // true while the distance condition has been continuously true
 unsigned long stopConditionStartTime = 0;     // millis() timestamp when the condition first became true
-const unsigned long STOP_CONFIRM_MS  = 1000;  // how long the condition must hold before actually stopping
+const unsigned long STOP_CONFIRM_MS  = 300;  // how long the condition must hold before actually stopping
 
 float getSmoothedHeading() {
   float raw = getCurrentHeading();
