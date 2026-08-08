@@ -36,9 +36,9 @@
 // ==========================================
 //          CONFIGURABLE VARIABLES
 // ==========================================
- float SLOW_STEER_THRESHOLD = 50.0; // Angle (in degrees) where the servo starts returning to center
-int STRAIGHT_SPEED = 150;  // Cruise speed for driving straight (0-255)
-int TURN_SPEED     = 150;  // Controlled speed for turning to prevent overshooting
+ float SLOW_STEER_THRESHOLD = 75.0; // Angle (in degrees) where the servo starts returning to center
+int STRAIGHT_SPEED = 255;  // Cruise speed for driving straight (0-255)
+int TURN_SPEED     = 200;  // Controlled speed for turning to prevent overshooting
 int BACKWARD_SPEED = -150; // Speed for backing up (if needed)
 
 const int RAMP_START_SPEED = 30;

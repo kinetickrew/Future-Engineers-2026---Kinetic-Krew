@@ -15,7 +15,7 @@ from PIL import Image
 DANGER_LEFT  = 70
 DANGER_RIGHT = 170
 # --- Minimum height (in pixels) before the robot starts to swerve ---
-MIN_SWERVE_HEIGHT = 45   # block must be at least this tall to trigger avoidance
+MIN_SWERVE_HEIGHT = 30   # block must be at least this tall to trigger avoidance
 REVERSE_HEIGHT = 80  # if block is below this y, reverse instead of swerve
             # --- Thresholds for determining which side the block is on ---
 LEFT_SIDE_MAX   = 90   # pixel x < this = left side
@@ -46,7 +46,7 @@ def rgb_to_lab(frame: np.ndarray) -> np.ndarray:
 def get_masks(lab: np.ndarray, calib: dict) -> tuple:
     L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
     chroma = np.sqrt(a ** 2 + b ** 2)
-    min_chroma = 10.0
+    min_chroma = 20.0
 
     red = calib.get('red')
     green = calib.get('green')
@@ -65,13 +65,14 @@ def get_masks(lab: np.ndarray, calib: dict) -> tuple:
     return red_mask, green_mask
 
 
-def extract_bounding_box(mask: np.ndarray, min_area: int = 60, min_extent: float = 0.55) -> dict:
+def extract_bounding_box(mask: np.ndarray, min_area: int = 150, min_extent: float = 0.55) -> dict:
     """Finds the largest connected blob in the mask and returns its box."""
     from scipy import ndimage
 
     if mask.sum() < min_area:
         return None
-
+    if MIN_SWERVE_HEIGHT < 25:
+        return None
     labeled, n_components = ndimage.label(mask)
     if n_components == 0:
         return None
@@ -413,7 +414,7 @@ def main(camera_id: int = 0, frame_size: int = 240):
     """Main function with improved camera handling."""
 
     # --- Lock exposure/white balance before opening the stream ---
-    set_manual_camera_controls(camera_id, exposure_value=500, wb_temperature=4500)
+    set_manual_camera_controls(camera_id, exposure_value=700, wb_temperature=4500)
 
     # --- Serial connection to ESP32 ---
     try:
@@ -586,13 +587,13 @@ def main(camera_id: int = 0, frame_size: int = 240):
                 else:
                     if current_detection == 'red':
                         ser.write(b'RED\n')
-                        print(">>> Sent RED")
+                        print(">>> RED command triggered" if ser else ">>> WOULD SEND RED (no serial)")
                     elif current_detection == 'green':
                         ser.write(b'GREEN\n')
-                        print(">>> Sent GREEN")
+                        print(">>> GREEN command triggered" if ser else ">>> WOULD SEND GREEN (no serial)")
                     else:
                         ser.write(b'CLEAR\n')
-                        print(">>> Sent CLEAR")
+                        print(">>> CLEAR command triggered" if ser else ">>> WOULD SEND CLEAR (no serial)")
                     last_sent = current_detection
 
             # Send smoothed steering data every frame while tracking
