@@ -18,17 +18,39 @@ DANGER_RIGHT = 170
 MIN_SWERVE_HEIGHT = 30   # block must be at least this tall to trigger avoidance
 REVERSE_HEIGHT = 80  # if block is below this y, reverse instead of swerve
             # --- Thresholds for determining which side the block is on ---
-LEFT_SIDE_MAX   = 90   # pixel x < this = left side
-RIGHT_SIDE_MIN  = 150   # pixel x > this = right side
+LEFT_SIDE_MAX   = 90   # pixel x < this = left side (trigger)
+RIGHT_SIDE_MIN  = 150   # pixel x > this = right side (trigger)
 
-# --- NEW: minimum time to stay committed to an avoidance maneuver ---
+# --- NEW: extra margin required before we call it "safe" and release the
+# swerve. This must be wider than LEFT_SIDE_MAX / narrower than
+# RIGHT_SIDE_MIN so a block hovering right at the trigger line doesn't cause
+# an instant release the moment it crosses the line.
+RELEASE_MARGIN = 15
+LEFT_RELEASE_MAX  = LEFT_SIDE_MAX - RELEASE_MARGIN    # e.g. 75
+RIGHT_RELEASE_MIN = RIGHT_SIDE_MIN + RELEASE_MARGIN   # e.g. 165
+
+# --- Minimum time to stay committed to an avoidance maneuver ---
 # Once we start swerving around a block, we keep steering away from it for at
 # least this many seconds, even if the block's bounding box slips into the
 # "safe" zone in the meantime (which happens right as we pass alongside it).
 # Without this, the CLEAR command fires the instant the box crosses the
 # safe-zone line, the servo snaps back to center immediately, and the robot
 # clips the block on the way past. Tune this to how long a swerve takes.
-AVOID_MIN_DURATION_S = 2.0
+AVOID_MIN_DURATION_S = 3.0
+
+# --- NEW: number of consecutive frames the detector must agree things are
+# clear (time elapsed AND block past the release margin) before we actually
+# let go of the swerve. This stops a single flickery "safe" frame right as
+# the timer expires from immediately snapping the servo back to center.
+RELEASE_CONFIRM_FRAMES = 6
+
+# --- NEW: horizon line. Blocks whose center is above this fraction of the
+# frame height (i.e. closer to the top = farther away / smaller on screen)
+# are ignored entirely — not detected, not prioritized. Frame y=0 is the top,
+# y=frame_size is the bottom (closest to the robot). "75% of screen" means
+# the line sits 75% of the way down, and anything above it (center_y smaller
+# than that) is treated as too far away to matter yet.
+HORIZON_LINE_FRAC = 0.75
 
 
 def rgb_to_lab(frame: np.ndarray) -> np.ndarray:
@@ -81,8 +103,6 @@ def extract_bounding_box(mask: np.ndarray, min_area: int = 150, min_extent: floa
     from scipy import ndimage
 
     if mask.sum() < min_area:
-        return None
-    if MIN_SWERVE_HEIGHT < 25:
         return None
     labeled, n_components = ndimage.label(mask)
     if n_components == 0:
@@ -173,6 +193,38 @@ def draw_boxes(frame_bgr: np.ndarray, red_box: dict, green_box: dict, roi: tuple
     return out
 
 
+def draw_guides(frame_bgr: np.ndarray, frame_size: int) -> np.ndarray:
+    """Draw all steering/detection guide lines on the display frame.
+    Shared by both the calibration view and the live detection view so
+    they're always consistent."""
+    out = frame_bgr.copy()
+    h = frame_size - 1
+    horizon_y = int(frame_size * HORIZON_LINE_FRAC)
+
+    # Trigger lines (when we start swerving)
+    cv2.line(out, (LEFT_SIDE_MAX, 0), (LEFT_SIDE_MAX, h), (0, 165, 255), 1)
+    cv2.putText(out, "RED TRIGGER <", (2, 10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 165, 255), 1)
+
+    cv2.line(out, (RIGHT_SIDE_MIN, 0), (RIGHT_SIDE_MIN, h), (0, 255, 0), 1)
+    cv2.putText(out, "GREEN TRIGGER >", (RIGHT_SIDE_MIN + 2, 10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 0), 1)
+
+    # Release (hysteresis) lines — must clear these before we let go of a swerve
+    cv2.line(out, (LEFT_RELEASE_MAX, 0), (LEFT_RELEASE_MAX, h), (0, 100, 255), 1)
+    cv2.putText(out, "RED RELEASE", (2, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 100, 255), 1)
+
+    cv2.line(out, (RIGHT_RELEASE_MIN, 0), (RIGHT_RELEASE_MIN, h), (0, 180, 0), 1)
+    cv2.putText(out, "GREEN RELEASE", (RIGHT_RELEASE_MIN + 2, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 180, 0), 1)
+
+    cv2.putText(out, "DANGER", (LEFT_SIDE_MAX + 5, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
+
+    # Horizon line — blocks above this (smaller y = farther away) are ignored
+    cv2.line(out, (0, horizon_y), (frame_size - 1, horizon_y), (255, 200, 0), 1)
+    cv2.putText(out, "IGNORE ABOVE THIS LINE", (2, horizon_y - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 200, 0), 1)
+
+    return out
+
+
 def sample_roi_lab(frame: np.ndarray, roi: tuple) -> np.ndarray:
     """Sample LAB values from ROI."""
     x, y, w, h = roi
@@ -231,6 +283,7 @@ def run_calibration_session(get_frame, roi: tuple, window_name: str) -> dict:
 
         bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         display = draw_boxes(bgr, red_box, green_box, roi=roi)
+        display = draw_guides(display, frame.shape[0])
         display = upscale_for_display(display, scale=3)
         status = (f"RED samples:{len(samples['red'])} GREEN samples:{len(samples['green'])} | "
                   f"1=sample RED  2=sample GREEN  N=done  Q=abort")
@@ -488,12 +541,18 @@ def main(camera_id: int = 0, frame_size: int = 240):
 
     last_sent = None
     frame_count = 0
-    clear_counter = 0      
+    clear_counter = 0
     CLEAR_HISTORY = 10
 
-    # --- NEW: tracks when the *current* avoidance maneuver began, so we can
+    # --- Tracks when the *current* avoidance maneuver began, so we can
     # hold the swerve for at least AVOID_MIN_DURATION_S before allowing CLEAR ---
     avoid_start_time = None
+
+    # --- NEW: counts consecutive frames where release conditions (time +
+    # margin) have all been satisfied. Release only happens once this reaches
+    # RELEASE_CONFIRM_FRAMES, so a single flickery "safe" reading doesn't
+    # snap the servo back to center too early. ---
+    release_confirm_counter = 0
 
     try:
         while True:
@@ -502,6 +561,16 @@ def main(camera_id: int = 0, frame_size: int = 240):
                 continue
 
             red_box, green_box = process_frame(frame, calib)
+
+            # --- Horizon filter: ignore blocks that are too far away (near
+            # the top of the frame). center_y is measured from the top, so
+            # "above the horizon line" means center_y < horizon_y. ---
+            horizon_y = int(frame_size * HORIZON_LINE_FRAC)
+            if red_box is not None and red_box['center_y'] < horizon_y:
+                red_box = None
+            if green_box is not None and green_box['center_y'] < horizon_y:
+                green_box = None
+
             red_hist.append(red_box)
             green_hist.append(green_box)
 
@@ -543,14 +612,14 @@ def main(camera_id: int = 0, frame_size: int = 240):
 
             if primary_box is not None:
                 block_height = primary_box['height']
-                
-                # --- Too far away? (below 80) ---
-                if block_height < MIN_SWERVE_HEIGHT:   # REVERSE_HEIGHT = 80
+
+                # --- Too far away? ---
+                if block_height < MIN_SWERVE_HEIGHT:
                     current_detection = None
                     active_box = None
-                
-                # --- Dangerously close? (above 100) ---
-                elif block_height > REVERSE_HEIGHT:   # MIN_SWERVE_HEIGHT = 100
+
+                # --- Dangerously close? ---
+                elif block_height > REVERSE_HEIGHT:
                     if ser is not None:
                         ser.write(b'REVERSE\n')
                         print(">>> Sent REVERSE (too close)")
@@ -578,13 +647,16 @@ def main(camera_id: int = 0, frame_size: int = 240):
                     # skip the normal command for this frame
                     current_detection = None   # so it doesn't send RED/GREEN
 
-            # --- NEW: enforce a minimum avoidance hold time ---
+            # --- Enforce a minimum avoidance hold time + hysteresis + confirm streak ---
             # If we're actively avoiding a block (last_sent is RED/GREEN) and the
             # detector now says "safe" (current_detection is None), don't let go
-            # of the swerve until AVOID_MIN_DURATION_S has passed since we first
-            # started avoiding it. This stops the servo from snapping back to
-            # center — and clipping the block — the instant the box crosses into
-            # the safe zone mid-pass.
+            # of the swerve until ALL of the following are true:
+            #   1. AVOID_MIN_DURATION_S has passed since we first started avoiding it
+            #   2. The block (if still visible) is past the wider RELEASE margin,
+            #      not just barely across the original trigger line
+            #   3. Both of the above have held for RELEASE_CONFIRM_FRAMES in a row
+            # This stops the servo from snapping back to center — and clipping
+            # the block — the instant the box flickers into the safe zone.
             now_t = time.monotonic()
 
             if current_detection in ('red', 'green'):
@@ -592,14 +664,36 @@ def main(camera_id: int = 0, frame_size: int = 240):
                 # block we're avoiding.
                 if last_sent != current_detection or avoid_start_time is None:
                     avoid_start_time = now_t
+                release_confirm_counter = 0
+
             elif current_detection is None and last_sent in ('red', 'green'):
-                if avoid_start_time is not None and (now_t - avoid_start_time) < AVOID_MIN_DURATION_S:
-                    # Still inside the mandatory hold window — keep steering
-                    # away from the block even though it currently reads "safe".
+                time_ok = (avoid_start_time is not None and
+                           (now_t - avoid_start_time) >= AVOID_MIN_DURATION_S)
+
+                # Check against the wider release margin using whatever box we
+                # still have available (active_box first, else the raw primary_box
+                # from this frame, since active_box may have been cleared above).
+                box_for_check = active_box if active_box is not None else primary_box
+                margin_ok = True
+                if box_for_check is not None:
+                    if last_sent == 'red':
+                        margin_ok = box_for_check['center_x'] <= LEFT_RELEASE_MAX
+                    else:
+                        margin_ok = box_for_check['center_x'] >= RIGHT_RELEASE_MIN
+
+                if time_ok and margin_ok:
+                    release_confirm_counter += 1
+                else:
+                    release_confirm_counter = 0
+
+                if release_confirm_counter < RELEASE_CONFIRM_FRAMES:
+                    # Not confirmed clear yet — keep steering away from the
+                    # block even though this frame currently reads "safe".
                     current_detection = last_sent
                     active_box = None
                 else:
                     avoid_start_time = None
+                    release_confirm_counter = 0
 
             # --- Kalman smoothing for steering (single filter, reset on target change) ---
             if current_detection != kf_color:
@@ -643,15 +737,8 @@ def main(camera_id: int = 0, frame_size: int = 240):
             display_green = green_box if green_confirmed else None
             bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             display = draw_boxes(bgr, display_red, display_green)
+            display = draw_guides(display, frame_size)
 
-            cv2.line(display, (LEFT_SIDE_MAX, 0), (LEFT_SIDE_MAX, frame_size-1), (0, 165, 255), 1)
-            cv2.putText(display, "RED SAFE <", (2, 10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 165, 255), 1)
-            
-            cv2.line(display, (RIGHT_SIDE_MIN, 0), (RIGHT_SIDE_MIN, frame_size-1), (0,255,0), 1)
-            cv2.putText(display, "GREEN SAFE >", (RIGHT_SIDE_MIN+2, 10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 0), 1)
-
-            cv2.putText(display, "DANGER", (LEFT_SIDE_MAX+5, frame_size-10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
-            
             Ldisplay = upscale_for_display(display, scale=3)
             cv2.imshow(window_name, display)
             frame_count += 1
@@ -680,6 +767,7 @@ def main(camera_id: int = 0, frame_size: int = 240):
                 green_hist.clear()
                 last_sent = None
                 avoid_start_time = None
+                release_confirm_counter = 0
                 kf = create_kalman_filter()
                 kf_initialized = False
                 kf_color = None
