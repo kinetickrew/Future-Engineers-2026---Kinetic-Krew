@@ -480,7 +480,16 @@ def main(camera_id: int = 0, frame_size: int = 240):
     # --- Serial connection to ESP32 ---
     try:
         ser = serial.Serial('/dev/ttyUSB0', 115200, timeout=1)
-        print("Serial port opened")
+        print("Serial port opened — waiting for ESP32 to finish booting...")
+        # Opening the port toggles DTR/RTS on most ESP32 boards, which forces
+        # a reset. setup() then runs (BNO init + up to ~10s of gyro
+        # calibration wait) before loop() ever starts reading Serial. Any
+        # command sent before that finishes is sent into a rebooting board
+        # and silently lost. Give it time, then clear whatever boot-time
+        # noise landed in the input buffer.
+        time.sleep(4.0)
+        ser.reset_input_buffer()
+        print("ESP32 should be ready.")
     except Exception as e:
         print(f"Could not open serial port: {e}")
         ser = None
@@ -559,6 +568,20 @@ def main(camera_id: int = 0, frame_size: int = 240):
             frame = get_frame(timeout=0.5)
             if frame is None:
                 continue
+
+            # --- Drain ESP32 telemetry so the serial input buffer never fills up ---
+            # The firmware prints a status line over Serial every loop (~50Hz).
+            # If we never read it, the OS-level RX buffer on this side just
+            # keeps growing forever, which on some USB-serial chips eventually
+            # causes dropped bytes or write starvation — commands stop getting
+            # through with no error, often after a few minutes of runtime.
+            # We don't need the content, just need to keep clearing it out.
+            if ser is not None:
+                try:
+                    if ser.in_waiting:
+                        ser.read(ser.in_waiting)
+                except Exception:
+                    pass
 
             red_box, green_box = process_frame(frame, calib)
 
