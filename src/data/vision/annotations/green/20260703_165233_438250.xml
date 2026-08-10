@@ -1,0 +1,28 @@
+<annotation>
+	<folder>Green</folder>
+	<filename>20260703_165233_438250.jpg</filename>
+	<path>/Users/KanavC/Desktop/Future Engineers 2026 - Kinetic Krew/Green/20260703_165233_438250.jpg</path>
+	<source>
+		<database>Unknown</database>
+	</source>
+	<size>
+		<width>1920</width>
+		<height>1080</height>
+		<depth>3</depth>
+	</size>
+	<segmented>0</segmented>
+	<object>
+		<name>green</name>
+		<pose>Unspecified</pose>
+		<truncated>0</truncated>
+		<difficult>0</difficult>
+		<bndbox>
+			<xmin>734</xmin>
+			<ymin>549</ymin>
+			<xmax>997</xmax>
+			<ymax>1026</ymax>
+		</bndbox>
+	</object>
+</annotation>
+
+

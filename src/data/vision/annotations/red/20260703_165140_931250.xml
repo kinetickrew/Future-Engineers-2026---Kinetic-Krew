@@ -1,0 +1,28 @@
+<annotation>
+	<folder>Red</folder>
+	<filename>20260703_165140_931250.jpg</filename>
+	<path>/Users/KanavC/Desktop/Future Engineers 2026 - Kinetic Krew/Red/20260703_165140_931250.jpg</path>
+	<source>
+		<database>Unknown</database>
+	</source>
+	<size>
+		<width>1920</width>
+		<height>1080</height>
+		<depth>3</depth>
+	</size>
+	<segmented>0</segmented>
+	<object>
+		<name>red</name>
+		<pose>Unspecified</pose>
+		<truncated>0</truncated>
+		<difficult>0</difficult>
+		<bndbox>
+			<xmin>502</xmin>
+			<ymin>454</ymin>
+			<xmax>704</xmax>
+			<ymax>729</ymax>
+		</bndbox>
+	</object>
+</annotation>
+
+

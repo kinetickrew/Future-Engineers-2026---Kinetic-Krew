@@ -811,3 +811,4 @@ def main(camera_id: int = 0, frame_size: int = 240):
 
 if __name__ == "__main__":
     main(camera_id=0, frame_size=240)
+

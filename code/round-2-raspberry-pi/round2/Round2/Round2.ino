@@ -1006,4 +1006,10 @@ void loop() {
 
   printTelemetry(currentHeading);
   delay(20);
+<<<<<<< HEAD
 }
+=======
+}w
+
+
+>>>>>>> fb1ba20 (Finalized files for 12th August Submission)
