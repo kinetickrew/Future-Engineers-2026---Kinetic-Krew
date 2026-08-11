@@ -1,0 +1,622 @@
+#!/usr/bin/env python3
+"""
+WRO Future Engineers block detector — ONNX inference version.
+Serial output: commands + CSV coordinates (center_x,center_y,width,height).
+
+Waypoint (this file): when a confirmed block reaches STOP_HEIGHT_PX, freeze
+the robot pose as B, the block as A, and compute pass point C (AC_OFFSET_CM
+laterally). Prints A/B/C and the constant-curvature arc B→C. Sends STOP then
+WAYPOINT over serial. ESP firmware does not consume STOP/WAYPOINT yet.
+
+PARKING (added): magenta is voted/confirmed the same way as red/green. Once
+a confirmed magenta box reaches PARK_HEIGHT_PX, we send a "PARK\n" line.
+This is NOT a one-shot for the whole run: the ESP32 firmware is the one that
+decides whether it's actually time to park (it gates on lap/turn count), so
+if the marker is seen up close on an earlier lap and the firmware ignores
+it, the Pi needs to be able to send PARK again on a later lap. So instead of
+a permanent latch, PARK is debounced per-pass: it won't resend every frame
+while magenta is confirmed and close, but once magenta drops out of view for
+PARK_CLEAR_HISTORY frames, the trigger re-arms for the next pass.
+"""
+
+import math
+import time
+import threading
+import queue
+import subprocess
+import numpy as np
+import cv2
+import av
+import onnxruntime as ort
+from collections import deque
+
+# ---------------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------------
+ONNX_MODEL_PATH = "best_ncnn.onnx"
+MODEL_INPUT_SIZE = 224          # keep at 224 — this is what costs inference time
+CLASS_NAMES = {0: "green", 1: "red", 2: "magenta"}
+CONF_THRESHOLD = 0.55
+USE_CUDA_IF_AVAILABLE = False   # Pi is CPU; True only if you run this on a CUDA box
+
+# Capture is 640x480 MJPEG, then resized to a square for the detector/display.
+CAPTURE_W = 640
+CAPTURE_H = 480
+FRAME_SIZE = 240                # square working frame (not the ONNX input size)
+
+CAMERA_ID = 0
+CAMERA_EXPOSURE = 200
+CAMERA_WB_TEMP = 4500
+SERIAL_PORT = "/dev/ttyUSB1"
+SERIAL_BAUD = 115200
+
+# How many recent frames must see the same colour before we trust it.
+VOTE_HISTORY = 7
+MIN_VOTES = 5
+CLEAR_HISTORY = 10              # consecutive CLEAR frames before we drop a waypoint
+
+# Too close — abort / reverse (ESP does not handle REVERSE yet).
+REVERSE_HEIGHT_PX = 80
+
+# ---------------------------------------------------------------------------
+# Waypoint geometry — measure AB_DISTANCE_CM on the table at STOP_HEIGHT_PX
+# ---------------------------------------------------------------------------
+# When box height hits this, treat current robot pose as B and the block as A.
+# Start at 45 px (closer, tighter arc). If the turn to C is too sharp after a
+# run, drop this to 30 so the bot stops farther away and the arc is gentler.
+STOP_HEIGHT_PX = 45  # try 30 if the arc is too tight
+
+# AC: how far beside the block to pass. Red → +X (robot's right), green → -X.
+AC_OFFSET_CM = 25.0
+
+# AB: forward distance (cm) from robot to block when height is STOP_HEIGHT_PX.
+# Tape this at the SAME height you use above. If you change 45 → 30, measure AB
+# again — do not keep the 45 px distance or C will be computed too close.
+AB_DISTANCE_CM = 40.0
+
+# Real pillar height in cm (WRO traffic-sign / pillar). Used only for lateral (X)
+# similar-triangles. Depth Y uses AB_DISTANCE_CM scaled by STOP_HEIGHT_PX/height.
+REAL_BLOCK_HEIGHT_CM = 10.0
+
+# ---------------------------------------------------------------------------
+# Parking (magenta) config
+# ---------------------------------------------------------------------------
+# Box height (px) at which we consider the robot "at" the parking marker and
+# fire the one-shot PARK trigger. Tune this like STOP_HEIGHT_PX — bigger
+# number = triggers later/closer, smaller = triggers earlier/farther.
+PARK_HEIGHT_PX = 70
+
+# How many consecutive frames magenta must be gone before PARK is allowed to
+# fire again (re-arms the trigger for the next lap's pass by the marker).
+PARK_CLEAR_HISTORY = 10
+
+# ---------------------------------------------------------------------------
+# ONNX session setup
+# ---------------------------------------------------------------------------
+def load_onnx_session(model_path: str) -> tuple:
+    providers = ["CPUExecutionProvider"]
+    if USE_CUDA_IF_AVAILABLE and "CUDAExecutionProvider" in ort.get_available_providers():
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+    session = ort.InferenceSession(model_path, providers=providers)
+    input_name = session.get_inputs()[0].name
+    output_names = [o.name for o in session.get_outputs()]
+    print(f"Loaded ONNX model '{model_path}' | providers={session.get_providers()} "
+          f"| input={input_name} | outputs={output_names}")
+    return session, input_name, output_names
+
+# ---------------------------------------------------------------------------
+# Preprocessing — letterbox to a square, track scale/offset to map boxes back
+# ---------------------------------------------------------------------------
+def preprocess(frame: np.ndarray, size: int) -> tuple:
+    h, w = frame.shape[:2]
+    scale = size / max(h, w)
+    nh, nw = int(h * scale), int(w * scale)
+    resized = cv2.resize(frame, (nw, nh))
+    canvas = np.full((size, size, 3), 114, dtype=np.uint8)
+    top = (size - nh) // 2
+    left = (size - nw) // 2
+    canvas[top:top + nh, left:left + nw] = resized
+
+    tensor = canvas.astype(np.float32) / 255.0
+    tensor = tensor.transpose(2, 0, 1)          # HWC -> CHW
+    tensor = np.expand_dims(tensor, axis=0)     # -> NCHW
+    return np.ascontiguousarray(tensor), scale, left, top
+
+# ---------------------------------------------------------------------------
+# Postprocessing — decode Ultralytics-style output + NMS, map back to frame
+# ---------------------------------------------------------------------------
+def decode_onnx_output(raw_output: np.ndarray, scale: float, left: int, top: int,
+                        conf_thresh: float) -> dict:
+    """raw_output: (1, 300, 6) -> [x1,y1,x2,y2,conf,cls_id]."""
+    preds = raw_output[0]   # (300, 6)
+
+    best_per_class = {}
+    for pred in preds:
+        x1, y1, x2, y2, conf, cls_id = pred
+        if conf < conf_thresh:
+            continue
+        cls_id = int(cls_id)
+        if cls_id not in best_per_class or conf > best_per_class[cls_id][0]:
+            best_per_class[cls_id] = (float(conf), x1, y1, x2, y2)
+
+    results = {}
+    for cls_id, (conf, x1, y1, x2, y2) in best_per_class.items():
+        color = CLASS_NAMES.get(cls_id)
+        if color is None:
+            continue
+        ox1 = (x1 - left) / scale
+        oy1 = (y1 - top) / scale
+        ox2 = (x2 - left) / scale
+        oy2 = (y2 - top) / scale
+        ow = ox2 - ox1
+        oh = oy2 - oy1
+
+        results[color] = {
+            "x": int(round(ox1)), "y": int(round(oy1)),
+            "width": int(round(ow)), "height": int(round(oh)),
+            "center_x": int(round(ox1 + ow / 2)), "center_y": int(round(oy1 + oh / 2)),
+            "confidence": conf,
+        }
+    return results
+
+def detect_blocks_onnx(frame: np.ndarray, session, input_name: str) -> tuple:
+    tensor, scale, left, top = preprocess(frame, MODEL_INPUT_SIZE)
+    outputs = session.run(None, {input_name: tensor})
+    decoded = decode_onnx_output(outputs[0], scale, left, top, CONF_THRESHOLD)
+    return decoded.get("red"), decoded.get("green"), decoded.get("magenta")
+
+# ---------------------------------------------------------------------------
+# Waypoint: A = block, B = robot at stop, C = pass point beside A
+# Robot frame at freeze: B = (0, 0), +X = right, +Y = forward (camera axis)
+# ---------------------------------------------------------------------------
+def block_to_robot_xy(box: dict, frame_size: int) -> tuple:
+    """Map a detection to robot-frame centimetres (A relative to B)."""
+    h = max(int(box["height"]), 1)
+    cx = float(box["center_x"])
+    ccx = frame_size / 2.0
+
+    # 640x480 squeezed to a square: width pixels are stretched vs height pixels.
+    x_aspect = CAPTURE_W / float(CAPTURE_H)
+
+    # Depth from the calibrated AB at STOP_HEIGHT_PX, scaled if we trigger late/early.
+    y_a = AB_DISTANCE_CM * (STOP_HEIGHT_PX / float(h))
+
+    # Lateral from similar triangles, using real pillar height vs box height.
+    x_a = (cx - ccx) * x_aspect * (REAL_BLOCK_HEIGHT_CM / float(h))
+    return x_a, y_a
+
+
+def pass_point_c(x_a: float, y_a: float, color: str) -> tuple:
+    """C is AC_OFFSET_CM horizontally from A. Red = pass right, green = pass left."""
+    side = 1.0 if color == "red" else -1.0
+    return x_a + side * AC_OFFSET_CM, y_a
+
+
+def arc_b_to_c(x_c: float, y_c: float) -> dict:
+    """
+    Constant-curvature forward arc from B=(0,0) heading +Y to C=(x_c, y_c).
+    Signed radius: + = right turn, - = left. Infinite radius = drive straight.
+    """
+    dist_sq = x_c * x_c + y_c * y_c
+    dist = math.sqrt(dist_sq)
+
+    if abs(x_c) < 0.5:
+        return {
+            "radius_cm": float("inf"),
+            "theta_deg": 0.0,
+            "arc_len_cm": abs(y_c),
+            "turn": "straight",
+        }
+
+    radius = dist_sq / (2.0 * x_c)
+    theta_rad = 2.0 * math.atan2(x_c, y_c) if y_c != 0 else math.copysign(math.pi, x_c)
+    arc_len = abs(radius * theta_rad)
+    return {
+        "radius_cm": radius,
+        "theta_deg": math.degrees(theta_rad),
+        "arc_len_cm": arc_len,
+        "turn": "right" if radius > 0 else "left",
+        "chord_cm": dist,
+    }
+
+
+def compute_waypoint(box: dict, color: str, frame_size: int) -> dict:
+    x_a, y_a = block_to_robot_xy(box, frame_size)
+    x_c, y_c = pass_point_c(x_a, y_a, color)
+    arc = arc_b_to_c(x_c, y_c)
+    wp = {
+        "color": color,
+        "A_cm": (x_a, y_a),
+        "B_cm": (0.0, 0.0),
+        "C_cm": (x_c, y_c),
+        "AC_cm": AC_OFFSET_CM,
+        "AB_cm": math.hypot(x_a, y_a),
+        "box": {
+            "center_x": box["center_x"],
+            "center_y": box["center_y"],
+            "width": box["width"],
+            "height": box["height"],
+        },
+        **arc,
+    }
+    return wp
+
+
+def format_waypoint_line(wp: dict) -> str:
+    xa, ya = wp["A_cm"]
+    xc, yc = wp["C_cm"]
+    r = wp["radius_cm"]
+    r_str = "inf" if math.isinf(r) else f"{r:.1f}"
+    return (
+        f"WAYPOINT,{wp['color']},{xa:.1f},{ya:.1f},{xc:.1f},{yc:.1f},"
+        f"{r_str},{wp['theta_deg']:.1f},{wp['arc_len_cm']:.1f}\n"
+    )
+
+
+def print_waypoint(wp: dict) -> None:
+    xa, ya = wp["A_cm"]
+    xc, yc = wp["C_cm"]
+    r = wp["radius_cm"]
+    r_str = "straight" if math.isinf(r) else f"{r:.1f} cm ({wp['turn']})"
+    print(
+        f"WAYPOINT lock color={wp['color']} "
+        f"A=({xa:.1f},{ya:.1f}) cm  B=(0,0)  C=({xc:.1f},{yc:.1f}) cm  "
+        f"arc R={r_str}  theta={wp['theta_deg']:.1f} deg  len={wp['arc_len_cm']:.1f} cm"
+    )
+
+# ---------------------------------------------------------------------------
+# Display helpers
+# ---------------------------------------------------------------------------
+def upscale_for_display(frame_bgr: np.ndarray, scale: int = 3) -> np.ndarray:
+    h, w = frame_bgr.shape[:2]
+    return cv2.resize(frame_bgr, (w * scale, h * scale), interpolation=cv2.INTER_NEAREST)
+
+def draw_boxes(frame_bgr: np.ndarray, red_box: dict, green_box: dict, magenta_box: dict = None) -> np.ndarray:
+    out = frame_bgr.copy()
+    boxes = [
+        (red_box, (0, 0, 255), "RED"),
+        (green_box, (0, 255, 0), "GREEN"),
+        (magenta_box, (255, 0, 255), "MAGENTA"),
+    ]
+    for box, bgr_color, label in boxes:
+        if not box:
+            continue
+        x, y, w, h = box['x'], box['y'], box['width'], box['height']
+        cx, cy = box['center_x'], box['center_y']
+        cv2.rectangle(out, (x, y), (x + w, y + h), bgr_color, 2)
+        cv2.circle(out, (cx, cy), 3, bgr_color, -1)
+        conf = box.get('confidence')
+        conf_str = f" conf={conf:.2f}" if conf is not None else ""
+        cv2.putText(out, f"{label} {w}x{h}px{conf_str}", (x, max(0, y - 22)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, bgr_color, 1)
+        cv2.putText(out, f"pos=({x},{y}) center=({cx},{cy})", (x, max(0, y - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, bgr_color, 1)
+    return out
+
+# ---------------------------------------------------------------------------
+# Camera capture
+# ---------------------------------------------------------------------------
+def open_camera(camera_id: int):
+    extra = {"fflags": "nobuffer", "flags": "low_delay"}
+    try:
+        container = av.open(
+            f"/dev/video{camera_id}",
+            format="v4l2",
+            options={"video_size": "640x480", "framerate": "30", "input_format": "mjpeg", **extra},
+        )
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        return container, stream
+    except Exception:
+        try:
+            container = av.open(
+                f"/dev/video{camera_id}",
+                format="v4l2",
+                options={"video_size": "640x480", "framerate": "30", "input_format": "yuyv422", **extra},
+            )
+            stream = container.streams.video[0]
+            stream.thread_type = "AUTO"
+            return container, stream
+        except Exception as e:
+            print(f"Camera error: {e}")
+            return None, None
+
+def close_container(container):
+    if container is None:
+        return
+    try:
+        container.close()
+    except Exception:
+        pass
+
+def resize_frame(frame: np.ndarray, target_w: int = 240, target_h: int = 240) -> np.ndarray:
+    if frame is None or frame.size == 0:
+        return None
+    return cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+def start_capture_thread(camera_id: int, frame_size=240):
+    """Own the camera in this thread. Skip corrupt packets; reopen on USB/decode death."""
+    frame_q = queue.Queue(maxsize=1)
+    stop_flag = threading.Event()
+    holder = {"container": None}
+
+    def enqueue(img):
+        if img is None:
+            return
+        if frame_q.full():
+            try:
+                frame_q.get_nowait()
+            except queue.Empty:
+                pass
+        frame_q.put(img)
+
+    def capture_loop():
+        while not stop_flag.is_set():
+            container, stream = open_camera(camera_id)
+            holder["container"] = container
+            if container is None:
+                time.sleep(0.5)
+                continue
+            try:
+                for packet in container.demux(stream):
+                    if stop_flag.is_set():
+                        break
+                    try:
+                        decoded = packet.decode()
+                    except av.AVError:
+                        # EINVAL 22 / corrupt MJPEG packet — skip, keep the thread alive
+                        continue
+                    except Exception:
+                        continue
+                    for frame in decoded:
+                        if stop_flag.is_set():
+                            break
+                        try:
+                            if frame.format.name != "rgb24":
+                                frame = frame.reformat(format="rgb24")
+                            img = frame.to_ndarray(format="rgb24")
+                            if img is not None and img.size > 0:
+                                enqueue(resize_frame(img, frame_size, frame_size))
+                        except Exception:
+                            continue
+            except Exception as e:
+                if not stop_flag.is_set():
+                    print(f"Capture stream dropped ({e}); reopening camera...")
+            finally:
+                close_container(container)
+                holder["container"] = None
+            if not stop_flag.is_set():
+                time.sleep(0.25)
+
+    t = threading.Thread(target=capture_loop, daemon=True)
+    t.start()
+    return t, frame_q, stop_flag, holder
+
+def set_manual_camera_controls(camera_id: int, exposure_value: int, wb_temperature: int):
+    dev = f'/dev/video{camera_id}'
+    cmds = [
+        ['v4l2-ctl', '-d', dev, '-c', 'auto_exposure=1'],
+        ['v4l2-ctl', '-d', dev, '-c', f'exposure_time_absolute={exposure_value}'],
+        ['v4l2-ctl', '-d', dev, '-c', 'white_balance_automatic=0'],
+        ['v4l2-ctl', '-d', dev, '-c', f'white_balance_temperature={wb_temperature}'],
+    ]
+    for cmd in cmds:
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"Warning: could not run {' '.join(cmd)} ({e})")
+    print(f"Camera controls locked: exposure={exposure_value}, wb_temp={wb_temperature}")
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main(camera_id: int = CAMERA_ID, frame_size: int = FRAME_SIZE):
+    set_manual_camera_controls(camera_id, CAMERA_EXPOSURE, CAMERA_WB_TEMP)
+
+    try:
+        import serial
+        ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
+        print(f"Serial port opened: {SERIAL_PORT}")
+    except Exception as e:
+        print(f"Could not open serial port: {e}")
+        ser = None
+
+    session, input_name, _ = load_onnx_session(ONNX_MODEL_PATH)
+
+    t, frame_q, stop_flag, cam = start_capture_thread(camera_id, frame_size)
+
+    def get_frame(timeout=1.0):
+        try:
+            return frame_q.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    print("Testing camera...")
+    test_frames = 0
+    for _ in range(10):
+        frame = get_frame(timeout=2.0)
+        if frame is not None:
+            test_frames += 1
+            print(f"Got test frame {test_frames}, shape: {frame.shape}")
+        time.sleep(0.1)
+
+    if test_frames == 0:
+        print("No frames received from camera!")
+        stop_flag.set()
+        t.join(timeout=2.0)
+        close_container(cam["container"])
+        return
+
+    window_name = "WRO Block Detector (ONNX)"
+    cv2.namedWindow(window_name)
+
+    red_hist = deque(maxlen=VOTE_HISTORY)
+    green_hist = deque(maxlen=VOTE_HISTORY)
+    magenta_hist = deque(maxlen=VOTE_HISTORY)
+
+    last_sent = None
+    frame_count = 0
+    clear_counter = 0
+    waypoint_lock = None   # frozen A/B/C until the block is gone (CLEAR)
+    park_armed = True      # True = allowed to fire PARK on the next close magenta sighting
+    park_clear_counter = 0 # consecutive frames without confirmed magenta, since park_armed went False
+
+    try:
+        while True:
+            frame = get_frame(timeout=0.5)
+            if frame is None:
+                continue
+
+            red_box, green_box, magenta_box = detect_blocks_onnx(frame, session, input_name)
+            red_hist.append(red_box)
+            green_hist.append(green_box)
+            magenta_hist.append(magenta_box)
+
+            def confirmed(hist):
+                return sum(1 for b in hist if b is not None) >= MIN_VOTES
+
+            red_confirmed = confirmed(red_hist)
+            green_confirmed = confirmed(green_hist)
+            magenta_confirmed = confirmed(magenta_hist)
+
+            # ---- Parking trigger (magenta) — re-arms each pass so the firmware ----
+            # ---- (which gates on lap count) can be sent PARK again on a later lap ----
+            if magenta_confirmed and magenta_box is not None and magenta_box['height'] >= PARK_HEIGHT_PX:
+                park_clear_counter = 0
+                if park_armed:
+                    if ser is not None:
+                        try:
+                            ser.write(b"PARK\n")
+                            print(">>> Sent PARK")
+                        except Exception as e:
+                            print(f"Serial write failed (PARK): {e}")
+                    else:
+                        print(">>> PARK triggered (no serial port open)")
+                    park_armed = False  # don't resend every frame of this same pass
+            else:
+                park_clear_counter += 1
+                if park_clear_counter >= PARK_CLEAR_HISTORY:
+                    park_armed = True  # marker is gone — ready to fire again next pass
+
+            primary_box = None
+            primary_color = None
+            if red_confirmed and green_confirmed:
+                if red_box is not None and green_box is not None:
+                    primary_box, primary_color = (red_box, 'red') if red_box['height'] >= green_box['height'] else (green_box, 'green')
+                elif red_box is not None:
+                    primary_box, primary_color = red_box, 'red'
+                elif green_box is not None:
+                    primary_box, primary_color = green_box, 'green'
+            elif red_confirmed:
+                primary_box, primary_color = red_box, 'red'
+            elif green_confirmed:
+                primary_box, primary_color = green_box, 'green'
+
+            # ---- Decision: ignore until stop height, then freeze C; reverse if too close ----
+            decision = 'CLEAR'
+            active_box = None
+
+            if primary_box is not None:
+                block_height = primary_box['height']
+                if block_height > REVERSE_HEIGHT_PX:
+                    decision = 'REVERSE'
+                    active_box = primary_box
+                elif block_height >= STOP_HEIGHT_PX:
+                    decision = 'STOP'
+                    active_box = primary_box
+
+            # Freeze A/B/C once at STOP_HEIGHT_PX; hold until CLEAR. REVERSE still aborts.
+            if decision == 'STOP' and waypoint_lock is None and active_box is not None and primary_color:
+                waypoint_lock = compute_waypoint(active_box, primary_color, frame_size)
+                print_waypoint(waypoint_lock)
+            elif decision == 'REVERSE':
+                waypoint_lock = None
+            elif waypoint_lock is not None and decision != 'CLEAR':
+                decision = 'STOP'
+                active_box = active_box or waypoint_lock.get("box")
+
+            clear_counter = clear_counter + 1 if decision == 'CLEAR' else 0
+            if decision == 'CLEAR' and clear_counter >= CLEAR_HISTORY:
+                waypoint_lock = None
+
+            # ---- Build serial command string ----
+            if decision == 'REVERSE' and active_box is not None:
+                cmd_str = f"{decision},{active_box['center_x']},{active_box['center_y']},{active_box['width']},{active_box['height']}\n"
+            elif decision == 'STOP' and waypoint_lock is not None:
+                cmd_str = format_waypoint_line(waypoint_lock)
+            else:
+                cmd_str = "CLEAR\n"
+
+            # ---- Send over serial if command changed ----
+            if cmd_str != last_sent and ser is not None:
+                if not (decision == 'CLEAR' and clear_counter < CLEAR_HISTORY):  # debounce CLEAR
+                    try:
+                        if decision == 'STOP' and waypoint_lock is not None:
+                            stop_box = waypoint_lock["box"]
+                            stop_line = (
+                                f"STOP,{stop_box['center_x']},{stop_box['center_y']},"
+                                f"{stop_box['width']},{stop_box['height']}\n"
+                            )
+                            ser.write(stop_line.encode())
+                            print(f">>> Sent {stop_line.strip()}")
+                        ser.write(cmd_str.encode())
+                        print(f">>> Sent {cmd_str.strip()}")
+                        last_sent = cmd_str
+                    except Exception as e:
+                        print(f"Serial write failed: {e}")
+
+            # Display drawing (unchanged)
+            display_red = red_box if red_confirmed else None
+            display_green = green_box if green_confirmed else None
+            display_magenta = magenta_box if magenta_confirmed else None
+            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            display = draw_boxes(bgr, display_red, display_green, display_magenta)
+
+            h_now = primary_box['height'] if primary_box else 0
+            cv2.putText(
+                display,
+                f"h={h_now} stop={STOP_HEIGHT_PX} rev={REVERSE_HEIGHT_PX} park={PARK_HEIGHT_PX}",
+                (2, 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1,
+            )
+
+            if waypoint_lock is not None:
+                xc, yc = waypoint_lock["C_cm"]
+                cv2.putText(
+                    display,
+                    f"STOP {waypoint_lock['color']} C=({xc:.0f},{yc:.0f})cm",
+                    (2, frame_size - 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1,
+                )
+
+            if not park_armed:
+                cv2.putText(
+                    display,
+                    "PARK SENT (re-arms when marker clears)",
+                    (2, frame_size - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 0, 255), 1,
+                )
+
+            display = upscale_for_display(display, scale=3)
+            cv2.imshow(window_name, display)
+            frame_count += 1
+
+            print(f"Frame {frame_count} | {decision} | RED:{red_box} | GREEN:{green_box} | MAGENTA:{magenta_box}", flush=True)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_flag.set()
+        t.join(timeout=2.0)
+        close_container(cam["container"])
+        if ser is not None:
+            ser.close()
+        cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()

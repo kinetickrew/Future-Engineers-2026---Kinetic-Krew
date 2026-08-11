@@ -4,10 +4,16 @@
 #include <Adafruit_BNO055.h>
 #include <ESP32Servo.h>
 
+// ---- WiFi tuning console ----
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <ESPmDNS.h>
+
 
 // ==========================================
 //           PIN & HARDWARE DEFINITIONS
-// ========================================== 
+// ==========================================
 #define SERVO_PIN 13
 
 
@@ -21,7 +27,7 @@
 #define MUX_CH_LEFT   0
 #define MUX_CH_CENTER 1  // New Center LiDAR channel
 #define MUX_CH_RIGHT  2
-#define MUX_CH_BNO    5
+#define MUX_CH_BNO    4
 
 
 #define TFLUNA_I2C_ADDR 0x10
@@ -30,34 +36,53 @@
 // ==========================================
 //          CONFIGURABLE VARIABLES
 // ==========================================
- float SLOW_STEER_THRESHOLD = 50.0; // Angle (in degrees) where the servo starts returning to center
-int STRAIGHT_SPEED = 150;  // Cruise speed for driving straight (0-255)
-int TURN_SPEED     = 150;  // Controlled speed for turning to prevent overshooting
+ float SLOW_STEER_THRESHOLD = 75.0; // Angle (in degrees) where the servo starts returning to center
+int STRAIGHT_SPEED = 255;  // Cruise speed for driving straight (0-255)
+int TURN_SPEED     = 200;  // Controlled speed for turning to prevent overshooting
 int BACKWARD_SPEED = -150; // Speed for backing up (if needed)
 
+const int RAMP_START_SPEED = 30;
+const int RAMP_STEP = 30;
+const unsigned long RAMP_DURATION_MS = 2000;
 
-int SERVO_CENTER   = 90;   // Dead-center steering alignment
-int DIFF = 35; 
+
+int SERVO_CENTER   = 70;   // Dead-center steering alignment
+int DIFF = 25; 
 int SERVO_MAX_LEFT = SERVO_CENTER + DIFF;  // Physical mechanical limit for left turn
 int SERVO_MAX_RIGHT= SERVO_CENTER - DIFF;   // Physical mechanical limit for right turn
 
 // Change to true if your steering corrections move backwards during testing
 const bool INVERT_STEERING = true;
 
+int RA = 25;  
 
-const float STEERING_KP  = 1.2;   // Proportional gain — how hard it steers based on current error
-const float STEERING_KD  = 0.15 ;   // Derivative gain — how hard it "brakes" based on how fast error is changing
+float STEERING_KP  = 1.2;
+float STEERING_KI  = 0.02;   // NEW: integral gain — start small, tune up carefully
+float STEERING_KD  = 0.15;
 const float HEADING_DEADBAND = 1.5;   // degrees — ignore jitter smaller than this
 const int   MAX_STEER_CORRECTION = 20; // clamp — no single correction can swing the servo too hard
 const int SPIKE_THRESHOLD = 100;  // Trigger turning mode if sensor difference changes by this many cm
 const int MAX_TURNS      = 12;   // Total number of turns allowed before tracking the final stop distance
 
 unsigned long turnCooldownUntil = 0;   // NEW: timestamp until which obstacle checks are ignored
-const unsigned long TURN_COOLDOWN_MS = 300; // tune this — how long to ignore after a turn
+const unsigned long TURN_COOLDOWN_MS = 1000; // tune this — how long to ignore after a turn
 
 // Cardinal heading snap table — every commanded turn target is forced onto one of these,
 // so sensor noise/drift can never leave the robot aiming at something like 250°.
 const float CARDINAL_HEADINGS[4] = {0.0, 90.0, 180.0, 270.0};
+
+
+// ==========================================
+//        WIFI TUNING CONSOLE SETTINGS
+// ==========================================
+const char* AP_SSID     = "RobotTuner";
+const char* AP_PASSWORD = "tunemybot";   // must be 8+ characters for WPA2
+// Once connected to this WiFi network, open http://robot.local
+// or http://192.168.4.1 if robot.local doesn't resolve on your phone.
+
+WebServer server(80);
+Preferences prefs;
+
 
 // ==========================================
 //          GLOBAL STATE VARIABLES
@@ -89,8 +114,13 @@ int16_t currentRightDist    = -1;
 int finalServoAngle         = 90;
 float headingError          = 0.0;
 float angleDifference       = 0.0;
-float lastHeadingError       = 0.0;   // NEW: needed to calculate the D term
+float lastHeadingError       = 0.0;
+float integralError          = 0.0;   // NEW: running total of error over time
 unsigned long lastHeadingTime = 0;    // NEW: for time-based derivative
+
+// ---- Speed ramp-up state ----
+unsigned long driveStartTime = 0;   // when the very first straight-drive began
+bool rampActive = false;            // true while we're still ramping up from a stand-still
 
 // ==========================================
 //            I2C & SENSOR FUNCTIONS
@@ -127,6 +157,11 @@ float getCurrentHeading() {
 
 float filteredHeading = 0.0;
 bool headingInitialized = false;
+
+// --- Stop condition (L & R < 100cm, front < 150cm, held for 1 second) ---
+bool stopConditionActive             = false; // true while the distance condition has been continuously true
+unsigned long stopConditionStartTime = 0;     // millis() timestamp when the condition first became true
+const unsigned long STOP_CONFIRM_MS  = 300;  // how long the condition must hold before actually stopping
 
 float getSmoothedHeading() {
   float raw = getCurrentHeading();
@@ -195,6 +230,32 @@ void setMotorOutput(int speed) {
   analogWrite(MOTOR_PWM, constrain(speed, 0, 255));
 }
 
+// ==========================================
+//          SPEED RAMP-UP HELPER
+// ==========================================
+// On the very first start (t=0), speed climbs in RAMP_STEP increments from
+// RAMP_START_SPEED up to STRAIGHT_SPEED over RAMP_DURATION_MS, so the car
+// doesn't dump full torque instantly and pop a wheelie off the line.
+int getRampedSpeed() {
+  if (!rampActive) return STRAIGHT_SPEED;
+
+  unsigned long elapsed = millis() - driveStartTime;
+
+  if (elapsed >= RAMP_DURATION_MS) {
+    rampActive = false;           // ramp finished — stop computing it every loop
+    return STRAIGHT_SPEED;
+  }
+
+  // How many 30-speed steps fit between RAMP_START_SPEED and STRAIGHT_SPEED
+  int numSteps = max(1, (STRAIGHT_SPEED - RAMP_START_SPEED) / RAMP_STEP);
+  unsigned long stepDuration = RAMP_DURATION_MS / numSteps;
+
+  int stepIndex = elapsed / stepDuration;
+  int speed = RAMP_START_SPEED + stepIndex * RAMP_STEP;
+
+  return constrain(speed, RAMP_START_SPEED, STRAIGHT_SPEED);
+}
+
 
 // ==========================================
 //             BEHAVIOR LOGIC MODES
@@ -211,14 +272,14 @@ void checkObstacles() {
   if (hasTurnedOnce) {
     if (lockedDirectionLeft) {
       if (difference > SPIKE_THRESHOLD) {
-        float currentHeading = getCurrentHeading();
+        float currentHeading = getSmoothedHeading();
         isTurningLeft = true;
         turnTargetHeading = computeTurnTarget(currentHeading, true);
         currentState = TURNING;
       }
     } else {
       if (difference < -SPIKE_THRESHOLD) {
-        float currentHeading = getCurrentHeading();
+        float currentHeading = getSmoothedHeading();
         isTurningLeft = false;
         turnTargetHeading = computeTurnTarget(currentHeading, false);
         currentState = TURNING;
@@ -230,7 +291,7 @@ void checkObstacles() {
 
   // 2. FIRST TURN RUN
   if (difference > SPIKE_THRESHOLD) {
-    float currentHeading = getCurrentHeading();
+    float currentHeading = getSmoothedHeading();
     isTurningLeft = true;
     turnTargetHeading = computeTurnTarget(currentHeading, true);
     hasTurnedOnce = true;
@@ -243,7 +304,7 @@ void checkObstacles() {
     currentState = TURNING;
   }
   else if (difference < -SPIKE_THRESHOLD) {
-    float currentHeading = getCurrentHeading();
+    float currentHeading = getSmoothedHeading();
     isTurningLeft = false;
     turnTargetHeading = computeTurnTarget(currentHeading, false);
     hasTurnedOnce = true;
@@ -259,7 +320,7 @@ void checkObstacles() {
 
 
 void driveStraightMode(float currentHeading) {
-  setMotorOutput(STRAIGHT_SPEED);
+  setMotorOutput(getRampedSpeed());
 
   float rawError = straightTargetHeading - currentHeading;
   if (rawError > 180.0)  rawError -= 360.0;
@@ -273,17 +334,26 @@ void driveStraightMode(float currentHeading) {
   float dt = (now - lastHeadingTime) / 1000.0;
   if (dt < 0.001) dt = 0.001;
 
-  float errorRate = (rawError - lastHeadingError) / dt;
+float errorRate = (rawError - lastHeadingError) / dt;
 
-  // Deadband only affects the P term — small noise doesn't trigger a steering push,
-  // but the D term still sees smooth, continuous data
-  float pTermInput = (abs(rawError) < HEADING_DEADBAND) ? 0.0 : rawError;
+float pTermInput = (abs(rawError) < HEADING_DEADBAND) ? 0.0 : rawError;
 
-  int steeringCorrection = (int)(pTermInput * STEERING_KP + errorRate * STEERING_KD);
-  steeringCorrection = constrain(steeringCorrection, -MAX_STEER_CORRECTION, MAX_STEER_CORRECTION);
+// Only accumulate the integral when there's a real (non-deadbanded) error —
+// this stops it from slowly building up due to sensor noise while "on target"
+if (abs(rawError) >= HEADING_DEADBAND) {
+  integralError += rawError * dt;
+}
 
-  lastHeadingError = rawError;
-  lastHeadingTime = now;
+// Clamp the integral so it can't build up forever and cause a huge overcorrection
+// later (this is called "anti-windup" — a very common PID gotcha for beginners)
+const float MAX_INTEGRAL = 50.0;   // tune this — degrees·seconds
+integralError = constrain(integralError, -MAX_INTEGRAL, MAX_INTEGRAL);
+
+int steeringCorrection = (int)round(pTermInput * STEERING_KP + integralError * STEERING_KI + errorRate * STEERING_KD);
+steeringCorrection = constrain(steeringCorrection, -MAX_STEER_CORRECTION, MAX_STEER_CORRECTION);
+
+lastHeadingError = rawError;
+lastHeadingTime = now;
 
   if (INVERT_STEERING) {
     finalServoAngle = SERVO_CENTER + steeringCorrection;
@@ -312,10 +382,10 @@ void executeTurnMode(float currentHeading) {
     float progressFactor = remainingAngle / SLOW_STEER_THRESHOLD;
     if (isTurningLeft) {
       int maxOffset = leftExtreme - SERVO_CENTER;
-      finalServoAngle = SERVO_CENTER + (int)(maxOffset * progressFactor);
+      finalServoAngle = SERVO_CENTER + (int)round(maxOffset * progressFactor);
     } else {
       int maxOffset = SERVO_CENTER - rightExtreme;
-      finalServoAngle = SERVO_CENTER - (int)(maxOffset * progressFactor);
+      finalServoAngle = SERVO_CENTER - (int)round(maxOffset * progressFactor);
     }
   } else {
     finalServoAngle = isTurningLeft ? leftExtreme : rightExtreme;
@@ -325,13 +395,14 @@ void executeTurnMode(float currentHeading) {
   steeringServo.write(finalServoAngle);
 
 
-  if (remainingAngle < 6.0) {
+  if (remainingAngle < RA) {
   totalTurnsCount++;
   steeringServo.write(SERVO_CENTER);
   finalServoAngle = SERVO_CENTER;
   straightTargetHeading = turnTargetHeading;
   currentState = DRIVING_STRAIGHT;
   turnCooldownUntil = millis() + TURN_COOLDOWN_MS;   // NEW
+  integralError = 0.0;
   }
 }
 
@@ -389,6 +460,267 @@ void printTelemetry(float currentHeading) {
 
 
 // ==========================================
+//        WIFI TUNING CONSOLE — LOGIC
+// ==========================================
+void recomputeServoLimits() {
+  SERVO_MAX_LEFT  = SERVO_CENTER + DIFF;
+  SERVO_MAX_RIGHT = SERVO_CENTER - DIFF;
+}
+
+void loadTunables() {
+  prefs.begin("tuning", true); // read-only
+  SLOW_STEER_THRESHOLD = prefs.getFloat("slow", SLOW_STEER_THRESHOLD);
+  STRAIGHT_SPEED        = prefs.getInt("straight", STRAIGHT_SPEED);
+  TURN_SPEED            = prefs.getInt("turn", TURN_SPEED);
+  BACKWARD_SPEED        = prefs.getInt("back", BACKWARD_SPEED);
+  SERVO_CENTER          = prefs.getInt("center", SERVO_CENTER);
+  DIFF                  = prefs.getInt("diff", DIFF);
+  prefs.end();
+  recomputeServoLimits();
+}
+
+void saveTunables() {
+  prefs.begin("tuning", false); // read-write
+  prefs.putFloat("slow", SLOW_STEER_THRESHOLD);
+  prefs.putInt("straight", STRAIGHT_SPEED);
+  prefs.putInt("turn", TURN_SPEED);
+  prefs.putInt("back", BACKWARD_SPEED);
+  prefs.putInt("center", SERVO_CENTER);
+  prefs.putInt("diff", DIFF);
+  prefs.end();
+}
+
+// ==========================================
+//     BLUETOOTH TUNING COMMAND PARSER
+// ==========================================
+// Accepts lines like: TURN=150
+// Runtime-only — nothing is written to flash.
+void handleBluetoothCommands() {
+  static String btBuffer = "";
+
+  while (SerialBT.available()) {
+    char c = SerialBT.read();
+
+    if (c == '\n' || c == '\r') {
+      btBuffer.trim();
+      if (btBuffer.length() > 0) {
+        int eqIndex = btBuffer.indexOf('=');
+        if (eqIndex > 0) {
+          String name  = btBuffer.substring(0, eqIndex);
+          String value = btBuffer.substring(eqIndex + 1);
+          name.trim();
+          value.trim();
+          name.toUpperCase();
+
+          float fVal = value.toFloat();
+          bool recognized = true;
+
+          if      (name == "SLOW")     SLOW_STEER_THRESHOLD = fVal;
+          else if (name == "STRAIGHT") STRAIGHT_SPEED        = (int)fVal;
+          else if (name == "TURN")     TURN_SPEED             = (int)fVal;
+          else if (name == "BACK")     BACKWARD_SPEED         = (int)fVal;
+          else if (name == "CENTER")   { SERVO_CENTER = (int)fVal; recomputeServoLimits(); }
+          else if (name == "DIFF")     { DIFF = (int)fVal; recomputeServoLimits(); }
+          else if (name == "RA")       RA  = (int)fVal;
+          else if (name == "KP")       STEERING_KP = fVal;
+          else if (name == "KI")       STEERING_KI = fVal;
+          else if (name == "KD")       STEERING_KD = fVal;
+          else recognized = false;
+
+          if (recognized) {
+            SerialBT.print("OK: "); SerialBT.print(name);
+            SerialBT.print(" set to "); SerialBT.println(value);
+          } else {
+            SerialBT.print("ERR: unknown variable '"); SerialBT.print(name); SerialBT.println("'");
+          }
+        } else {
+          SerialBT.println("ERR: expected format NAME=VALUE");
+        }
+      }
+      btBuffer = "";
+    } else {
+      btBuffer += c;
+    }
+  }
+}
+
+String buildValuesJson() {
+  String json = "{";
+  json += "\"center\":" + String(SERVO_CENTER) + ",";
+  json += "\"diff\":" + String(DIFF) + ",";
+  json += "\"slow\":" + String(SLOW_STEER_THRESHOLD, 1) + ",";
+  json += "\"straight\":" + String(STRAIGHT_SPEED) + ",";
+  json += "\"turn\":" + String(TURN_SPEED) + ",";
+  json += "\"back\":" + String(BACKWARD_SPEED) + ",";
+  json += "\"maxLeft\":" + String(SERVO_MAX_LEFT) + ",";
+  json += "\"maxRight\":" + String(SERVO_MAX_RIGHT);
+  json += "}";
+  return json;
+}
+
+void handleGetValues() {
+  server.send(200, "application/json", buildValuesJson());
+}
+
+void handleSetValues() {
+  if (server.hasArg("center"))   SERVO_CENTER          = server.arg("center").toInt();
+  if (server.hasArg("diff"))     DIFF                  = server.arg("diff").toInt();
+  if (server.hasArg("slow"))     SLOW_STEER_THRESHOLD  = server.arg("slow").toFloat();
+  if (server.hasArg("straight")) STRAIGHT_SPEED        = server.arg("straight").toInt();
+  if (server.hasArg("turn"))     TURN_SPEED            = server.arg("turn").toInt();
+  if (server.hasArg("back"))     BACKWARD_SPEED        = server.arg("back").toInt();
+
+  recomputeServoLimits();
+  saveTunables(); // so it survives a reboot/power cycle
+
+  server.send(200, "application/json", buildValuesJson());
+}
+
+// The tuning page itself, served directly by the ESP32 — no internet required.
+const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Robot Tuner</title>
+<style>
+  body{ background:#0d1113; color:#e8edee; font-family:-apple-system,Arial,sans-serif; margin:0; padding:20px; }
+  h1{ font-size:20px; margin:0 0 4px; }
+  .sub{ color:#8fa0a5; font-size:12.5px; margin-bottom:20px; }
+  .field{ margin-bottom:22px; }
+  .row{ display:flex; justify-content:space-between; margin-bottom:6px; }
+  .name{ font-size:14px; }
+  .val{ font-family:monospace; color:#ffb020; font-weight:bold; }
+  input[type=range]{ width:100%; accent-color:#ffb020; }
+  #status{ font-family:monospace; font-size:12px; color:#57d9c9; margin-top:10px; min-height:18px; }
+  #status.err{ color:#ff6b5e; }
+</style>
+</head>
+<body>
+  <h1>Robot Tuner</h1>
+  <div class="sub">Connected directly to the robot's WiFi. Changes apply instantly.</div>
+
+  <div class="field">
+    <div class="row"><span class="name">SERVO_CENTER</span><span class="val" id="v-center">--</span></div>
+    <input type="range" id="s-center" min="0" max="180" value="90">
+  </div>
+  <div class="field">
+    <div class="row"><span class="name">DIFF</span><span class="val" id="v-diff">--</span></div>
+    <input type="range" id="s-diff" min="5" max="90" value="35">
+  </div>
+  <div class="field">
+    <div class="row"><span class="name">SLOW_STEER_THRESHOLD</span><span class="val" id="v-slow">--</span></div>
+    <input type="range" id="s-slow" min="10" max="150" value="50">
+  </div>
+  <div class="field">
+    <div class="row"><span class="name">STRAIGHT_SPEED</span><span class="val" id="v-straight">--</span></div>
+    <input type="range" id="s-straight" min="0" max="255" value="150">
+  </div>
+  <div class="field">
+    <div class="row"><span class="name">TURN_SPEED</span><span class="val" id="v-turn">--</span></div>
+    <input type="range" id="s-turn" min="0" max="255" value="150">
+  </div>
+  <div class="field">
+    <div class="row"><span class="name">BACKWARD_SPEED</span><span class="val" id="v-back">--</span></div>
+    <input type="range" id="s-back" min="-255" max="0" value="-150">
+  </div>
+
+  <div id="status">Loading current values...</div>
+
+<script>
+  const ids = ['center','diff','slow','straight','turn','back'];
+  const sliders = {}; const labels = {};
+  ids.forEach(id => {
+    sliders[id] = document.getElementById('s-' + id);
+    labels[id]  = document.getElementById('v-' + id);
+  });
+
+  const statusEl = document.getElementById('status');
+  let sendTimer = null;
+
+  function paintLabels(){
+    labels.center.textContent = sliders.center.value;
+    labels.diff.textContent = sliders.diff.value;
+    labels.slow.textContent = parseFloat(sliders.slow.value).toFixed(1);
+    labels.straight.textContent = sliders.straight.value;
+    labels.turn.textContent = sliders.turn.value;
+    labels.back.textContent = sliders.back.value;
+  }
+
+  function loadFromRobot(){
+    fetch('/get').then(r => r.json()).then(d => {
+      sliders.center.value = d.center;
+      sliders.diff.value = d.diff;
+      sliders.slow.value = d.slow;
+      sliders.straight.value = d.straight;
+      sliders.turn.value = d.turn;
+      sliders.back.value = d.back;
+      paintLabels();
+      statusEl.textContent = 'Synced with robot.';
+      statusEl.className = '';
+    }).catch(() => {
+      statusEl.textContent = 'Could not reach robot.';
+      statusEl.className = 'err';
+    });
+  }
+
+  function sendToRobot(){
+    const q = ids.map(id => id + '=' + sliders[id].value).join('&');
+    fetch('/set?' + q).then(r => r.json()).then(() => {
+      statusEl.textContent = 'Applied on robot.';
+      statusEl.className = '';
+    }).catch(() => {
+      statusEl.textContent = 'Robot unreachable — value not sent.';
+      statusEl.className = 'err';
+    });
+  }
+
+  ids.forEach(id => {
+    sliders[id].addEventListener('input', () => {
+      paintLabels();
+      statusEl.textContent = 'Sending...';
+      statusEl.className = '';
+      clearTimeout(sendTimer);
+      sendTimer = setTimeout(sendToRobot, 200); // debounce while dragging
+    });
+  });
+
+  loadFromRobot();
+</script>
+</body>
+</html>
+)HTMLPAGE";
+
+void handleRoot() {
+  server.send_P(200, "text/html", INDEX_HTML);
+}
+
+void setupWifiTuner() {
+  loadTunables(); // pull any previously-saved values before anything else uses them
+
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  delay(200);
+
+  IPAddress ip = WiFi.softAPIP();
+  Serial.print("Tuner WiFi: "); Serial.println(AP_SSID);
+  Serial.print("Tuner IP:   "); Serial.println(ip);
+  SerialBT.print("Tuner WiFi: "); SerialBT.println(AP_SSID);
+  SerialBT.print("Tuner IP:   "); SerialBT.println(ip);
+
+  if (MDNS.begin("robot")) {
+    Serial.println("mDNS ready — try http://robot.local");
+    SerialBT.println("mDNS ready — try http://robot.local");
+  }
+
+  server.on("/", handleRoot);
+  server.on("/get", handleGetValues);
+  server.on("/set", handleSetValues);
+  server.begin();
+}
+
+
+// ==========================================
 //             CORE ARDUINO SETUP
 // ==========================================
 void setup() {
@@ -400,6 +732,7 @@ void setup() {
   pinMode(MOTOR_IN2, OUTPUT);
   pinMode(MOTOR_PWM, OUTPUT);
 
+  // setupWifiTuner(); // loads saved tuning values (or the defaults above) + starts the web page
 
   steeringServo.attach(SERVO_PIN);
   steeringServo.write(SERVO_CENTER);
@@ -409,13 +742,31 @@ void setup() {
   if (!bno.begin()) {
     Serial.println("Critical Error: BNO055 missing on Multiplexer channel 4!");
     SerialBT.println("Critical Error: BNO055 missing on Multiplexer channel 4!");
-    while (1);
+    while (1) { server.handleClient(); } // keep the tuner alive even if the BNO fails
   }
   delay(500);
   bno.setExtCrystalUse(true);
 
+  // Wait for the gyro to calibrate before trusting the heading reading
+  Serial.println("Waiting for BNO055 calibration...");
+  uint8_t sysCal, gyroCal, accelCal, magCal;
+  unsigned long calStart = millis();
+  do {
+    selectMuxChannel(MUX_CH_BNO);              // must re-select the mux channel every I2C call
+    bno.getCalibration(&sysCal, &gyroCal, &accelCal, &magCal);
+    Serial.print("Cal - Sys:"); Serial.print(sysCal);
+    Serial.print(" Gyro:"); Serial.print(gyroCal);
+    Serial.print(" Accel:"); Serial.print(accelCal);
+    Serial.print(" Mag:"); Serial.println(magCal);
+    delay(200);
+  } while (gyroCal < 3 && millis() - calStart < 10000);  // wait up to 10s, prioritize gyro
+  Serial.println("Calibration wait done.");
 
   straightTargetHeading = getCurrentHeading();
+
+  // Begin the speed ramp for the very first start from a stand-still
+  driveStartTime = millis();
+  rampActive = true;
 }
 
 
@@ -423,6 +774,9 @@ void setup() {
 //             MAIN EXECUTION LOOP
 // ==========================================
 void loop() {
+  server.handleClient(); // always service the tuning page, in every state
+  handleBluetoothCommands();   // <-- add this line
+
   if (currentState == ROBOT_STOPPED) {
     setMotorOutput(0);
     steeringServo.write(SERVO_CENTER);
@@ -432,7 +786,7 @@ void loop() {
     SerialBT.print("STATUS: Finished. Total Turns Executed: ");
     SerialBT.println(totalTurnsCount);
    
-    delay(1000);
+    delay(200); // shorter than before so the tuner stays responsive after finishing
     return;
   }
 
@@ -442,12 +796,30 @@ void loop() {
   currentRightDist  = getLunaDistance(MUX_CH_RIGHT);
 
 
+
+
   float currentHeading = getSmoothedHeading();
 
 
-  if (totalTurnsCount >= MAX_TURNS && currentCenterDist > 0 && currentCenterDist < 165) {
-    currentState = ROBOT_STOPPED;
-    return;
+  // Stop condition: left AND right both under 100cm, and front (center) under 150cm.
+  // Must hold continuously for STOP_CONFIRM_MS before actually stopping,
+  // to avoid triggering on a single noisy/transient reading.
+  bool stopConditionMet =
+      (currentLeftDist   > 0 && currentLeftDist   < 100) &&
+      (currentRightDist  > 0 && currentRightDist  < 100) &&
+      (currentCenterDist > 0 && currentCenterDist < 150) &&
+      (totalTurnsCount >= MAX_TURNS);
+
+  if (stopConditionMet) {
+    if (!stopConditionActive) {
+      stopConditionActive = true;
+      stopConditionStartTime = millis();
+    } else if (millis() - stopConditionStartTime >= STOP_CONFIRM_MS) {
+      currentState = ROBOT_STOPPED;
+      return;
+    }
+  } else {
+    stopConditionActive = false; // reset — condition dropped out before the 1s delay completed
   }
 
 
